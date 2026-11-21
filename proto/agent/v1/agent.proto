@@ -1,0 +1,99 @@
+syntax = "proto3";
+
+package esp_pika.agent.v1;
+
+import "device/v1/device.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "esp-pika/backend/gateway/api/agent/v1;agentv1";
+
+service AgentSessionService {
+  rpc Converse(stream GatewayToAgentEvent) returns (stream AgentToGatewayEvent);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+  string agent_id = 2;
+}
+
+message GatewayToAgentEvent {
+  oneof payload {
+    SendTurn send_turn = 1;
+    SendEvent send_event = 2;
+    CancelTurn cancel = 3;
+  }
+}
+
+message SendTurn {
+  string session_id = 1;
+  string turn_id = 2;
+  string agent_id = 3;
+  string text = 4;
+  string speaker_id = 5;
+  esp_pika.device.v1.SpeakerRole speaker_role = 6;
+  float confidence = 7;
+  string source_device_id = 8;
+  string group_id = 9;
+  string zone = 10;
+  esp_pika.device.v1.DeviceShadow shadow_snapshot = 11;
+  string fleet_summary_json = 12;
+}
+
+message SendEvent {
+  string session_id = 1;
+  string agent_id = 2;
+  string source_device_id = 3;
+  string group_id = 4;
+  string zone = 5;
+  string event_type = 6;
+  string payload_json = 7;
+  google.protobuf.Timestamp occurred_at = 8;
+}
+
+message CancelTurn {
+  string session_id = 1;
+  string turn_id = 2;
+  string reason = 3;
+}
+
+message AgentToGatewayEvent {
+  oneof payload {
+    StatusUpdate status = 1;
+    TextDelta text_delta = 2;
+    UIUpdate ui_update = 3;
+    TurnDone done = 4;
+  }
+}
+
+message StatusUpdate {
+  string session_id = 1;
+  string turn_id = 2;
+  string state = 3;
+  string message = 4;
+  bool speak_hint = 5;
+}
+
+message TextDelta {
+  string session_id = 1;
+  string turn_id = 2;
+  string chunk = 3;
+  string tts_voice = 4;
+}
+
+message UIUpdate {
+  string session_id = 1;
+  string target_device_id = 2;
+  string emotion = 3;
+  string text = 4;
+  string card_json = 5;
+}
+
+message TurnDone {
+  string session_id = 1;
+  string turn_id = 2;
+  string finish_reason = 3;
+  string error_message = 4;
+}

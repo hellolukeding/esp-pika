@@ -1,0 +1,111 @@
+syntax = "proto3";
+
+package esp_pika.device.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "esp-pika/backend/gateway/api/device/v1;devicev1";
+
+enum ChipType {
+  CHIP_TYPE_UNSPECIFIED = 0;
+  CHIP_TYPE_ESP32_S31 = 1;
+  CHIP_TYPE_ESP32_S3 = 2;
+  CHIP_TYPE_ESP32_P4 = 3;
+  CHIP_TYPE_ESP32_C3 = 4;
+  CHIP_TYPE_ESP32_C5 = 5;
+  CHIP_TYPE_ESP32_C6 = 6;
+  CHIP_TYPE_ESP32 = 7;
+}
+
+enum CapabilityType {
+  CAPABILITY_TYPE_UNSPECIFIED = 0;
+  CAPABILITY_TYPE_TOOL = 1;
+  CAPABILITY_TYPE_SHADOW = 2;
+  CAPABILITY_TYPE_EVENT = 3;
+}
+
+enum SpeakerRole {
+  SPEAKER_ROLE_UNSPECIFIED = 0;
+  SPEAKER_ROLE_OWNER = 1;
+  SPEAKER_ROLE_MEMBER = 2;
+  SPEAKER_ROLE_GUEST = 3;
+}
+
+message AudioProfile {
+  string codec = 1;
+  uint32 sample_rate = 2;
+  uint32 frame_ms = 3;
+  uint32 channels = 4;
+}
+
+message AudioCapabilities {
+  AudioProfile uplink = 1;
+  AudioProfile downlink = 2;
+  repeated string features = 3;
+}
+
+message DeviceCapability {
+  string name = 1;
+  CapabilityType type = 2;
+  string description = 3;
+  string upload_channel = 4;
+  repeated string fields = 5;
+  string input_schema_json = 6;
+}
+
+message DeviceHello {
+  // Canonical lowercase colon-separated eFuse MAC address (e.g., "30:ed:a0:f3:dc:70").
+  string device_id = 1;
+  string mac = 2;
+  string group_id = 3;
+  string zone = 4;
+  ChipType chip = 5;
+  uint64 vp_version = 6;
+  string firmware_version = 7;
+  AudioCapabilities audio = 8;
+  repeated DeviceCapability capabilities = 9;
+}
+
+message DeviceShadow {
+  string device_id = 1;
+  string group_id = 2;
+  string zone = 3;
+  bool online = 4;
+  int32 battery_percent = 5;
+  int32 rssi = 6;
+  int32 volume = 7;
+  string vad_state = 8;
+  map<string, double> metrics = 9;
+  map<string, string> attributes = 10;
+  google.protobuf.Timestamp updated_at = 11;
+}
+
+message DeviceCommand {
+  string command_id = 1;
+  string device_id = 2;
+  string capability = 3;
+  string action = 4;
+  string params_json = 5;
+  uint32 timeout_ms = 6;
+}
+
+message DeviceCommandResult {
+  string command_id = 1;
+  string device_id = 2;
+  bool ok = 3;
+  string error_code = 4;
+  string error_message = 5;
+  string result_json = 6;
+  string media_url = 7;
+}
+
+message SpeechStart {
+  string session_id = 1;
+  string device_id = 2;
+  string speaker_id = 3;
+  SpeakerRole speaker_role = 4;
+  float confidence = 5;
+  bool uncertain = 6;
+  int32 doa_angle = 7;
+  string zone = 8;
+}

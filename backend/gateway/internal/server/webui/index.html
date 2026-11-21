@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>esp-pika Gateway 管理与调试台</title>
+  <style>
+    :root {
+      --bg: #0f141b;
+      --panel: #161d26;
+      --panel-alt: #1d2633;
+      --border: #283445;
+      --text: #e6edf5;
+      --muted: #8ea0b5;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --err: #ef4444;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.45;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 24px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; font-weight: 600; font-size: 16px; }
+    .pill {
+      font-size: 12px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--panel-alt);
+      border: 1px solid var(--border);
+      color: var(--muted);
+    }
+    .pill.ok { color: var(--ok); border-color: rgba(34, 197, 94, 0.35); }
+    .pill.err { color: var(--err); border-color: rgba(239, 68, 68, 0.35); }
+    nav {
+      display: flex;
+      gap: 8px;
+      padding: 10px 24px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      flex-wrap: wrap;
+    }
+    nav button {
+      background: transparent;
+      color: var(--muted);
+      border: 1px solid transparent;
+      padding: 7px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+    }
+    nav button.active {
+      background: var(--panel-alt);
+      color: var(--text);
+      border-color: var(--border);
+    }
+    main { max-width: 1280px; margin: 20px auto; padding: 0 20px 40px; }
+    .tab { display: none; }
+    .tab.active { display: block; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    h2 { margin: 0 0 12px; font-size: 15px; font-weight: 600; }
+    h3 { margin: 0 0 8px; font-size: 14px; font-weight: 600; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 10px; }
+    label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); flex: 1; min-width: 140px; }
+    input, select, textarea {
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 7px 10px;
+      font-size: 13px;
+      font-family: inherit;
+    }
+    textarea { font-family: var(--mono); min-height: 70px; }
+    button.btn {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 8px 14px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+    }
+    button.btn:hover { background: var(--accent-hover); }
+    button.btn.sec { background: var(--panel-alt); border: 1px solid var(--border); color: var(--text); }
+    button.btn.danger { background: rgba(239, 68, 68, 0.16); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    th { color: var(--muted); font-weight: 500; font-size: 12px; }
+    code, pre { font-family: var(--mono); font-size: 12px; }
+    pre.log {
+      background: #0a0e13;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      max-height: 320px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      margin: 0;
+    }
+    .tag {
+      display: inline-block;
+      font-size: 11px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: var(--panel-alt);
+      border: 1px solid var(--border);
+      margin-right: 4px;
+      margin-bottom: 4px;
+    }
+    .tag.online { color: var(--ok); border-color: rgba(34, 197, 94, 0.4); }
+    .tag.offline { color: var(--muted); }
+    .media-preview { max-width: 100%; max-height: 240px; border-radius: 6px; border: 1px solid var(--border); margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span>esp-pika Gateway Console</span>
+      <span id="health-pill" class="pill">检测中...</span>
+    </div>
+    <div class="row" style="margin:0;">
+      <button class="btn sec" id="refresh-all-btn">刷新全部</button>
+    </div>
+  </header>
+
+  <nav id="tabs">
+    <button class="active" data-tab="fleet">设备拓扑与指令</button>
+    <button data-tab="macs">MAC 白名单</button>
+    <button data-tab="acls">ACL 权限矩阵</button>
+    <button data-tab="speakers">声纹组管理</button>
+    <button data-tab="voice">实时录音与声纹调试</button>
+    <button data-tab="debug">WebSocket 实时调试</button>
+  </nav>
+
+  <main>
+    <!-- Fleet & Device Command -->
+    <section id="tab-fleet" class="tab active">
+      <div class="card">
+        <div class="row" style="justify-content:space-between; align-items:center;">
+          <h2 style="margin:0;">终端设备拓扑 &amp; Device Shadow</h2>
+          <span class="pill" id="device-count-pill">0 台设备</span>
+        </div>
+        <div id="devices-container" class="grid"></div>
+      </div>
+
+      <div class="card">
+        <h2>下发设备控制指令 (Gateway → Device)</h2>
+        <form id="cmd-form">
+          <div class="row">
+            <label>目标 Device ID / Zone
+              <input id="cmd-device" placeholder="30:ed:a0:f3:dc:70 或 entrance" required />
+            </label>
+            <label>Agent ID
+              <input id="cmd-agent" value="ez-assistant" required />
+            </label>
+            <label>能力 (Capability)
+              <select id="cmd-cap">
+                <option value="device.camera_capture">device.camera_capture</option>
+                <option value="device.display_show">device.display_show</option>
+                <option value="device.audio_set_volume">device.audio_set_volume</option>
+                <option value="device.actuator_set">device.actuator_set</option>
+                <option value="device.sensor_read">device.sensor_read</option>
+              </select>
+            </label>
+            <label>动作 (Action)
+              <input id="cmd-action" value="capture" required />
+            </label>
+          </div>
+          <div class="row">
+            <label>参数 JSON (`params_json`)
+              <textarea id="cmd-params">{"resolution":"vga"}</textarea>
+            </label>
+          </div>
+          <button class="btn" type="submit">发送指令</button>
+        </form>
+        <div style="margin-top:12px;">
+          <pre id="cmd-output" class="log">等待执行...</pre>
+          <img id="cmd-media-img" class="media-preview" style="display:none;" alt="Device Media Preview" />
+        </div>
+      </div>
+    </section>
+
+    <!-- MAC Whitelist -->
+    <section id="tab-macs" class="tab">
+      <div class="card">
+        <h2>添加 / 更新白名单设备 (`allowed_macs`)</h2>
+        <form id="mac-form">
+          <div class="row">
+            <label>出厂 eFuse MAC
+              <input id="mac-addr" placeholder="30:ed:a0:f3:dc:70" required />
+            </label>
+            <label>空间组 (`group_id`)
+              <input id="mac-group" value="home-default" required />
+            </label>
+            <label>房间 (`zone`)
+              <input id="mac-zone" value="study" required />
+            </label>
+            <label>备注标签
+              <input id="mac-label" placeholder="书房 ESP32-S31" />
+            </label>
+            <label>启用状态
+              <select id="mac-enabled">
+                <option value="true">启用</option>
+                <option value="false">禁用</option>
+              </select>
+            </label>
+          </div>
+          <button class="btn" type="submit">保存 MAC 白名单</button>
+        </form>
+      </div>
+      <div class="card">
+        <h2>已注册白名单列表</h2>
+        <table>
+          <thead><tr><th>MAC</th><th>Group</th><th>Zone</th><th>Label</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="macs-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ACL Matrix -->
+    <section id="tab-acls" class="tab">
+      <div class="card">
+        <h2>新增 / 更新 Agent → Device ACL 规则</h2>
+        <form id="acl-form">
+          <div class="row">
+            <label>Rule ID
+              <input id="acl-id" value="allow-ez-default" required />
+            </label>
+            <label>Agent ID
+              <input id="acl-agent" value="ez-assistant" required />
+            </label>
+            <label>Group ID
+              <input id="acl-group" value="home-default" />
+            </label>
+            <label>Zone Pattern (`*` 为通配)
+              <input id="acl-zone" value="*" />
+            </label>
+            <label>Capability Pattern
+              <input id="acl-cap" value="device.*" />
+            </label>
+            <label>最低说话人角色
+              <select id="acl-role">
+                <option value="1">Owner (1)</option>
+                <option value="2">Member (2)</option>
+                <option value="3">Guest (3)</option>
+              </select>
+            </label>
+            <label>策略
+              <select id="acl-allow">
+                <option value="true">允许 (Allow)</option>
+                <option value="false">拒绝 (Deny)</option>
+              </select>
+            </label>
+          </div>
+          <button class="btn" type="submit">保存 ACL 规则</button>
+        </form>
+      </div>
+      <div class="card">
+        <h2>生效中 ACL 规则列表</h2>
+        <table>
+          <thead><tr><th>Rule ID</th><th>Agent</th><th>Group / Zone</th><th>Capability</th><th>Min Role</th><th>策略</th><th>操作</th></tr></thead>
+          <tbody id="acls-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Speakers -->
+    <section id="tab-speakers" class="tab">
+      <div class="card">
+        <h2>新增 / 更新说话人声纹组 (`speaker_groups`)</h2>
+        <form id="speaker-form">
+          <div class="row">
+            <label>Speaker ID
+              <input id="sp-id" placeholder="spk_luke" required />
+            </label>
+            <label>展示名
+              <input id="sp-name" placeholder="Luke" required />
+            </label>
+            <label>UID
+              <input id="sp-uid" value="u_default" />
+            </label>
+            <label>绑定 Agent ID
+              <input id="sp-agent" value="ez-assistant" />
+            </label>
+            <label>Group ID
+              <input id="sp-group" value="home-default" />
+            </label>
+            <label>角色
+              <select id="sp-role">
+                <option value="1">Owner (1)</option>
+                <option value="2">Member (2)</option>
+                <option value="3">Guest (3)</option>
+              </select>
+            </label>
+            <label>TTS 音色 (`tts_voice`)
+              <input id="sp-voice" value="zh_female_calm" />
+            </label>
+          </div>
+          <div class="row">
+            <label>专属系统人设 (`prompt`)
+              <input id="sp-prompt" placeholder="简洁口语化回答" />
+            </label>
+          </div>
+          <button class="btn" type="submit">保存说话人并同步在线终端</button>
+        </form>
+      </div>
+      <div class="card">
+        <h2>已配置声纹组</h2>
+        <table>
+          <thead><tr><th>Speaker ID</th><th>Name</th><th>Role</th><th>Agent</th><th>TTS Voice</th><th>Version</th><th>操作</th></tr></thead>
+          <tbody id="speakers-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Live Microphone Recorder & Voiceprint Enroll/Identify -->
+    <section id="tab-voice" class="tab">
+      <div class="card">
+        <h2>浏览器实时麦克风录音（16 kHz Mono PCM / WAV）</h2>
+        <div class="row" style="align-items:center;">
+          <button class="btn" id="rec-start-btn">开始麦克风录音</button>
+          <button class="btn danger" id="rec-stop-btn" disabled>停止录音</button>
+          <button class="btn sec" id="rec-synth-a-btn">生成合成样本 (150 Hz)</button>
+          <button class="btn sec" id="rec-synth-b-btn">生成合成样本 (420 Hz)</button>
+          <span id="rec-status" class="pill">未录音</span>
+        </div>
+        <div class="row" style="align-items:center;">
+          <label style="flex:0 0 220px;">实时输入电平
+            <progress id="rec-level" max="100" value="0" style="width:100%; height:14px;"></progress>
+          </label>
+          <audio id="rec-audio-player" controls style="height:36px; display:none;"></audio>
+        </div>
+      </div>
+
+      <div class="grid">
+        <div class="card">
+          <h2>1. 实时声纹注册 (`POST /api/v1/voice/enroll`)</h2>
+          <div class="row">
+            <label>Speaker ID <input id="vp-speaker-id" value="spk_luke" /></label>
+            <label>展示名 <input id="vp-display-name" value="Luke" /></label>
+          </div>
+          <div class="row">
+            <label>UID <input id="vp-uid" value="u_default" /></label>
+            <label>Agent ID <input id="vp-agent" value="ez-assistant" /></label>
+            <label>Group ID <input id="vp-group" value="home-default" /></label>
+          </div>
+          <div class="row">
+            <label>身份角色
+              <select id="vp-role">
+                <option value="1">Owner (1)</option>
+                <option value="2">Member (2)</option>
+                <option value="3">Guest (3)</option>
+              </select>
+            </label>
+            <label>TTS 音色 <input id="vp-tts-voice" value="zh_female_calm" /></label>
+          </div>
+          <button class="btn" id="vp-enroll-btn">使用当前录音注册声纹</button>
+          <pre id="vp-enroll-log" class="log" style="margin-top:10px;">等待录音与注册...</pre>
+        </div>
+
+        <div class="card">
+          <h2>2. 实时声纹识别与 ASR 验证</h2>
+          <div class="row">
+            <button class="btn" id="vp-identify-btn">声纹识别 (`/api/v1/voice/identify`)</button>
+            <button class="btn sec" id="vp-asr-btn">ASR 转写 (`/api/v1/voice/transcribe`)</button>
+            <button class="btn sec" id="vp-ws-send-btn">经 WS 发送音频测试</button>
+          </div>
+          <div class="row" style="align-items:center;">
+            <label style="flex:1;">余弦相似度置信度
+              <progress id="vp-score-bar" max="100" value="0" style="width:100%; height:14px;"></progress>
+            </label>
+            <span id="vp-tier-pill" class="pill">未识别</span>
+          </div>
+          <pre id="vp-identify-log" class="log">等待识别...</pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- Live WS Debug Console -->
+    <section id="tab-debug" class="tab">
+      <div class="card">
+        <h2>浏览器虚拟终端调试 (`/ws/device?mac=...`)</h2>
+        <div class="row">
+          <label>终端 MAC（须先在白名单启用）
+            <input id="ws-mac" value="30:ed:a0:f3:dc:70" />
+          </label>
+          <label>Zone
+            <input id="ws-zone" value="study" />
+          </label>
+          <label>说话人 ID
+            <input id="ws-speaker" value="spk_luke" />
+          </label>
+          <label>Agent ID
+            <input id="ws-agent" value="ez-assistant" />
+          </label>
+        </div>
+        <div class="row">
+          <button class="btn" id="ws-connect-btn">连接并发送 device.hello</button>
+          <button class="btn sec" id="ws-disconnect-btn">断开连接</button>
+          <button class="btn sec" id="ws-wake-btn">发送 wake.detected</button>
+          <span id="ws-status" class="pill">未连接</span>
+        </div>
+        <div class="row">
+          <label>发送文本对话回合 (`text.turn` → Agent → TTS)
+            <input id="ws-turn-text" value="帮我看看门口是谁" />
+          </label>
+          <button class="btn" id="ws-send-turn-btn">发送对话</button>
+          <button class="btn danger" id="ws-barge-btn">打断 (`speech.barge_in`)</button>
+        </div>
+        <pre id="ws-log" class="log">等待 WebSocket 连接...</pre>
+      </div>
+    </section>
+  </main>
+
+  <script src="/ui/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+# ESP-IDF Partition Table for ESP32-S31 Voice & Multimodal Agent Terminal
+# Name,   Type, SubType,  Offset,   Size,   Flags
+nvs,      data, nvs,      ,         0x6000,
+nvs_keys, data, nvs_keys, ,         0x1000, encrypted
+otadata,  data, ota,      ,         0x2000,
+phy_init, data, phy,      ,         0x1000,
+ota_0,    app,  ota_0,    ,         3M,
+ota_1,    app,  ota_1,    ,         3M,
+model,    data, spiffs,   ,         4M,     readonly

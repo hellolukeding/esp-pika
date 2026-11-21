@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "esp-pika": {
+      "enabled": true,
+      "displayName": "ESP-Pika Device Fleet",
+      "description": "Control and inspect registered ESP32-S31 devices via Voice & Device Gateway",
+      "url": "http://127.0.0.1:8080/mcp",
+      "headers": {
+        "X-Agent-ID": "default-agent",
+        "X-Speaker-Role": "owner"
+      },
+      "startupTimeoutMs": 10000,
+      "toolTimeoutMs": 15000
+    }
+  }
+}

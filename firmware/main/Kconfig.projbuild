@@ -1,0 +1,54 @@
+menu "esp-pika Device Configuration"
+
+    choice ESP_PIKA_BOARD_TYPE
+        prompt "Target Board"
+        default ESP_PIKA_BOARD_S31_MOSAICO
+        help
+            Select the ESP32-S31 development board hardware profile.
+
+        config ESP_PIKA_BOARD_S31_MOSAICO
+            bool "ESP-Mosaico (ESP32-S31 + ES8311 + CO5300 AMOLED)"
+
+        config ESP_PIKA_BOARD_S31_COREBOARD1
+            bool "ESP32-S31-Function-CoreBoard-1"
+
+        config ESP_PIKA_BOARD_S31_KORVO1
+            bool "ESP32-S31-Korvo-1 (Dual-Mic + DVP Camera + 4.3-inch LCD)"
+    endchoice
+
+    config ESP_PIKA_WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+        help
+            Wi-Fi SSID used by the device to connect to the local network.
+
+    config ESP_PIKA_WIFI_PASSWORD
+        string "Wi-Fi Password"
+        default ""
+        help
+            Wi-Fi password for WPA2/WPA3 authentication.
+
+    config ESP_PIKA_GROUP_ID
+        string "Device Group ID"
+        default "home-default"
+        help
+            Spatial/home group identifier used for multi-device wake arbitration and voiceprint sync.
+
+    config ESP_PIKA_ZONE
+        string "Device Room / Zone"
+        default "study"
+        help
+            Logical room or zone name reported in device.hello (e.g. living_room, study, entrance).
+
+    config ESP_PIKA_FALLBACK_GATEWAY_HOST
+        string "Fallback Gateway Host (optional)"
+        default ""
+        help
+            Optional fallback gateway hostname or IP if mDNS discovery times out.
+
+    config ESP_PIKA_FALLBACK_GATEWAY_PORT
+        int "Fallback Gateway Port"
+        default 8080
+        range 1 65535
+
+endmenu

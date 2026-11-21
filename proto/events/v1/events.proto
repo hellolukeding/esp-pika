@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package esp_pika.events.v1;
+
+import "device/v1/device.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "esp-pika/backend/gateway/api/events/v1;eventsv1";
+
+message WakeDetected {
+  string device_id = 1;
+  string group_id = 2;
+  string zone = 3;
+  string wake_word = 4;
+  float wake_score = 5;
+  float snr_db = 6;
+  int64 detected_at_ms = 7;
+}
+
+message WakeDecision {
+  string group_id = 1;
+  string winner_device_id = 2;
+  string target_device_id = 3;
+  bool accepted = 4;
+  string reason = 5;
+  int64 decided_at_ms = 6;
+}
+
+message VoiceprintTemplate {
+  string speaker_id = 1;
+  string display_name = 2;
+  esp_pika.device.v1.SpeakerRole role = 3;
+  repeated float embedding = 4;
+  uint64 version = 5;
+}
+
+message VoiceprintSyncEvent {
+  string group_id = 1;
+  uint64 vp_version = 2;
+  bool full_sync = 3;
+  repeated VoiceprintTemplate upserts = 4;
+  repeated string deleted_speaker_ids = 5;
+}
+
+message SensorPushEvent {
+  string device_id = 1;
+  string group_id = 2;
+  string zone = 3;
+  string event_type = 4;
+  string payload_json = 5;
+  google.protobuf.Timestamp occurred_at = 6;
+}
+
+message DevicePresenceEvent {
+  string device_id = 1;
+  string group_id = 2;
+  string zone = 3;
+  bool online = 4;
+  google.protobuf.Timestamp occurred_at = 5;
+}

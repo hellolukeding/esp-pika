@@ -1,0 +1,16 @@
+# Common ESP-IDF v6.x defaults for esp-pika firmware
+CONFIG_IDF_TARGET="esp32s31"
+
+# Partition table
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/partitions.csv"
+
+# C++20 without exceptions/RTTI per AGENTS.md
+CONFIG_COMPILER_CXX_EXCEPTIONS=n
+CONFIG_COMPILER_CXX_RTTI=n
+
+# FreeRTOS 1000Hz tick for responsive audio & DFS
+CONFIG_FREERTOS_HZ=1000
+
+# NVS encryption is enabled in sdkconfig.defaults.prod alongside Flash encryption / eFuse keys
+# CONFIG_NVS_ENCRYPTION is not set

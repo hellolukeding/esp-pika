@@ -1,0 +1,17 @@
+# ESP32-S31 specific defaults
+CONFIG_IDF_TARGET="esp32s31"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# USB Serial/JTAG secondary console
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# USB-OTG TinyUSB CDC virtual serial console (required by ESP-Mosaico USB-C port)
+CONFIG_TINYUSB_CDC_ENABLED=y
+
+# PSRAM for Pre-roll, Opus queues, Voiceprint Tensor Arena, JPEG/LCD buffers
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_USE_MALLOC=y
+
+# C++20 / mDNS / WebSocket / AFE assembly stack headroom in app_main
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_MDNS_TASK_STACK_SIZE=8192

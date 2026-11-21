@@ -1,0 +1,20 @@
+# Production hardening sdkconfig profile for ESP32-S31 (M5)
+# Merge with:
+#   idf.py -D SDKCONFIG_DEFAULTS="configs/sdkconfig.defaults;configs/sdkconfig.defaults.esp32s31;configs/sdkconfig.defaults.prod" build
+# WARNING: Do NOT enable on bench dev boards without understanding eFuse irreversible burning!
+
+# Secure Boot v2 (RSA-3072 / ECDSA) & Anti-rollback
+CONFIG_SECURE_BOOT=y
+CONFIG_SECURE_BOOT_V2_ENABLED=y
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=y
+
+# Flash, PSRAM & NVS XTS-AES encryption
+CONFIG_SECURE_FLASH_ENC_ENABLED=y
+CONFIG_SECURE_FLASH_ENCRYPTION_MODE_RELEASE=y
+CONFIG_NVS_ENCRYPTION=y
+CONFIG_NVS_SEC_KEY_PROTECT_USING_FLASH_ENC=y
+
+# Disable UART ROM download & insecure JTAG in release builds
+CONFIG_SECURE_UART_ROM_DL_MODE=y
+CONFIG_SECURE_DISABLE_ROM_DL_MODE=y

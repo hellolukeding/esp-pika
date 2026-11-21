@@ -1,0 +1,235 @@
+syntax = "proto3";
+
+package esp_pika.gateway.v1;
+
+import "device/v1/device.proto";
+import "google/api/annotations.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "esp-pika/backend/gateway/api/gateway/v1;gatewayv1";
+
+service GatewayAdminService {
+  rpc UpsertAllowedMac(UpsertAllowedMacRequest) returns (AllowedMacEntry) {
+    option (google.api.http) = {
+      put: "/api/v1/macs/{mac}"
+      body: "*"
+    };
+  }
+
+  rpc DeleteAllowedMac(DeleteAllowedMacRequest) returns (DeleteAllowedMacResponse) {
+    option (google.api.http) = {
+      delete: "/api/v1/macs/{mac}"
+    };
+  }
+
+  rpc ListAllowedMacs(ListAllowedMacsRequest) returns (ListAllowedMacsResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/macs"
+    };
+  }
+
+  rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/devices"
+    };
+  }
+
+  rpc GetDeviceShadow(GetDeviceShadowRequest) returns (esp_pika.device.v1.DeviceShadow) {
+    option (google.api.http) = {
+      get: "/api/v1/devices/{device_id}/shadow"
+    };
+  }
+
+  rpc InvokeDeviceCommand(InvokeDeviceCommandRequest) returns (esp_pika.device.v1.DeviceCommandResult) {
+    option (google.api.http) = {
+      post: "/api/v1/devices/{device_id}/commands"
+      body: "*"
+    };
+  }
+
+  rpc UpsertSpeakerGroup(UpsertSpeakerGroupRequest) returns (SpeakerGroup) {
+    option (google.api.http) = {
+      put: "/api/v1/speakers/{speaker_id}"
+      body: "*"
+    };
+  }
+
+  rpc ListSpeakerGroups(ListSpeakerGroupsRequest) returns (ListSpeakerGroupsResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/speakers"
+    };
+  }
+
+  rpc DeleteSpeakerGroup(DeleteSpeakerGroupRequest) returns (DeleteSpeakerGroupResponse) {
+    option (google.api.http) = {
+      delete: "/api/v1/speakers/{speaker_id}"
+    };
+  }
+
+  rpc UpsertACLRule(UpsertACLRuleRequest) returns (ACLRule) {
+    option (google.api.http) = {
+      put: "/api/v1/acls/{rule_id}"
+      body: "*"
+    };
+  }
+
+  rpc ListACLRules(ListACLRulesRequest) returns (ListACLRulesResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/acls"
+    };
+  }
+
+  rpc DeleteACLRule(DeleteACLRuleRequest) returns (DeleteACLRuleResponse) {
+    option (google.api.http) = {
+      delete: "/api/v1/acls/{rule_id}"
+    };
+  }
+}
+
+enum ErrorReason {
+  ERROR_REASON_UNSPECIFIED = 0;
+  ERROR_REASON_MAC_NOT_ALLOWED = 1;
+  ERROR_REASON_DEVICE_OFFLINE = 2;
+  ERROR_REASON_DEVICE_NOT_FOUND = 3;
+  ERROR_REASON_ACL_DENIED = 4;
+  ERROR_REASON_INVALID_ARGUMENT = 5;
+}
+
+message AllowedMacEntry {
+  string mac = 1;
+  string group_id = 2;
+  string zone = 3;
+  string label = 4;
+  bool enabled = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+
+message UpsertAllowedMacRequest {
+  string mac = 1;
+  string group_id = 2;
+  string zone = 3;
+  string label = 4;
+  bool enabled = 5;
+}
+
+message DeleteAllowedMacRequest {
+  string mac = 1;
+}
+
+message DeleteAllowedMacResponse {
+  bool deleted = 1;
+}
+
+message ListAllowedMacsRequest {
+  string group_id = 1;
+}
+
+message ListAllowedMacsResponse {
+  repeated AllowedMacEntry items = 1;
+}
+
+message DeviceSummary {
+  esp_pika.device.v1.DeviceHello hello = 1;
+  esp_pika.device.v1.DeviceShadow shadow = 2;
+}
+
+message ListDevicesRequest {
+  string group_id = 1;
+  bool online_only = 2;
+}
+
+message ListDevicesResponse {
+  repeated DeviceSummary devices = 1;
+}
+
+message GetDeviceShadowRequest {
+  string device_id = 1;
+}
+
+message InvokeDeviceCommandRequest {
+  string device_id = 1;
+  string agent_id = 2;
+  string capability = 3;
+  string action = 4;
+  string params_json = 5;
+  uint32 timeout_ms = 6;
+}
+
+message SpeakerGroup {
+  string speaker_id = 1;
+  string uid = 2;
+  string agent_id = 3;
+  string group_id = 4;
+  string display_name = 5;
+  esp_pika.device.v1.SpeakerRole role = 6;
+  string prompt = 7;
+  string tts_voice = 8;
+  uint64 version = 9;
+  google.protobuf.Timestamp updated_at = 10;
+}
+
+message UpsertSpeakerGroupRequest {
+  string speaker_id = 1;
+  string uid = 2;
+  string agent_id = 3;
+  string group_id = 4;
+  string display_name = 5;
+  esp_pika.device.v1.SpeakerRole role = 6;
+  string prompt = 7;
+  string tts_voice = 8;
+}
+
+message ListSpeakerGroupsRequest {
+  string group_id = 1;
+}
+
+message ListSpeakerGroupsResponse {
+  repeated SpeakerGroup speakers = 1;
+}
+
+message DeleteSpeakerGroupRequest {
+  string speaker_id = 1;
+}
+
+message DeleteSpeakerGroupResponse {
+  bool deleted = 1;
+}
+
+message ACLRule {
+  string rule_id = 1;
+  string agent_id = 2;
+  string group_id = 3;
+  string zone_pattern = 4;
+  string device_id = 5;
+  string capability_pattern = 6;
+  esp_pika.device.v1.SpeakerRole min_speaker_role = 7;
+  bool allow = 8;
+}
+
+message UpsertACLRuleRequest {
+  string rule_id = 1;
+  string agent_id = 2;
+  string group_id = 3;
+  string zone_pattern = 4;
+  string device_id = 5;
+  string capability_pattern = 6;
+  esp_pika.device.v1.SpeakerRole min_speaker_role = 7;
+  bool allow = 8;
+}
+
+message ListACLRulesRequest {
+  string agent_id = 1;
+}
+
+message ListACLRulesResponse {
+  repeated ACLRule rules = 1;
+}
+
+message DeleteACLRuleRequest {
+  string rule_id = 1;
+}
+
+message DeleteACLRuleResponse {
+  bool deleted = 1;
+}

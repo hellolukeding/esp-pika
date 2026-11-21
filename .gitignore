@@ -1,0 +1,62 @@
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets & Local Configs
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+backend/gateway/configs/config.yaml
+!backend/gateway/configs/config.example.yaml
+
+# ESP-IDF / Firmware
+firmware/build/
+firmware/build_host/
+firmware/managed_components/
+firmware/dependencies.lock
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/sdkconfig.ci.*
+eim_config.toml
+*.ppm
+*.elf
+*.bin
+*.map
+*.o
+*.d
+
+# Go / Kratos Backend & Agent Bridge
+backend/**/bin/
+backend/**/tmp/
+agent/**/bin/
+agent/**/tmp/
+*.exe
+*.test
+*.out
+coverage.txt
+
+# Local Data & Databases
+*.db
+*.sqlite
+*.sqlite3
+deploy/local/data/
+qdrant_storage/
+nats_data/
+
+# Python / Agent (reserved)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+
+# External / Nested Repos (cloned separately)
+ez-assistant/
