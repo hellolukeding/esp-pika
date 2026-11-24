@@ -161,3 +161,149 @@ func ExtractOggOpusPackets(raw []byte) [][]byte {
 func isOpusHeaderPacket(pkt []byte) bool {
 	return bytes.HasPrefix(pkt, []byte("OpusHead")) || bytes.HasPrefix(pkt, []byte("OpusTags"))
 }
+
+// SplitOpusPackets expands any RFC 6716 multi-frame Opus packets into single-frame packets (code=0)
+// so decoders capped at 60 ms (e.g., ESP-IDF esp_opus_dec default config) can decode 80-120 ms TTS packets.
+func SplitOpusPackets(packets [][]byte) [][]byte {
+	if len(packets) == 0 {
+		return packets
+	}
+	out := make([][]byte, 0, len(packets))
+	for _, pkt := range packets {
+		out = append(out, SplitOpusPacketToSingleFrames(pkt)...)
+	}
+	return out
+}
+
+// SplitOpusPacketToSingleFrames splits a single RFC 6716 Opus packet into code=0 single-frame packets.
+// Non-Opus or malformed packets are returned intact as a single-element slice.
+func SplitOpusPacketToSingleFrames(pkt []byte) [][]byte {
+	if len(pkt) == 0 {
+		return nil
+	}
+	toc := pkt[0]
+	code := toc & 0x03
+	singleTOC := toc & 0xFC
+
+	emitFrame := func(payload []byte) []byte {
+		f := make([]byte, 1+len(payload))
+		f[0] = singleTOC
+		copy(f[1:], payload)
+		return f
+	}
+
+	switch code {
+	case 0:
+		return [][]byte{pkt}
+	case 1:
+		rem := len(pkt) - 1
+		if rem < 4 || rem%2 != 0 {
+			return [][]byte{pkt}
+		}
+		fLen := rem / 2
+		return [][]byte{
+			emitFrame(pkt[1 : 1+fLen]),
+			emitFrame(pkt[1+fLen:]),
+		}
+	case 2:
+		pos := 1
+		n1, ok := parseOpusFrameLength(pkt, &pos, len(pkt))
+		n2 := len(pkt) - (pos + n1)
+		if !ok || n1 < 2 || n2 < 2 {
+			return [][]byte{pkt}
+		}
+		return [][]byte{
+			emitFrame(pkt[pos : pos+n1]),
+			emitFrame(pkt[pos+n1:]),
+		}
+	case 3:
+		if len(pkt) < 2 {
+			return [][]byte{pkt}
+		}
+		fc := pkt[1]
+		vbr := (fc & 0x80) != 0
+		hasPad := (fc & 0x40) != 0
+		m := int(fc & 0x3F)
+		if m <= 0 || m > 48 {
+			return [][]byte{pkt}
+		}
+		pos := 2
+		end := len(pkt)
+		if hasPad {
+			totalPad := 0
+			for {
+				if pos >= end {
+					return [][]byte{pkt}
+				}
+				p := int(pkt[pos])
+				pos++
+				if p == 255 {
+					totalPad += 254
+					if totalPad > end-pos {
+						return [][]byte{pkt}
+					}
+					continue
+				}
+				totalPad += p
+				break
+			}
+			if end-pos < totalPad {
+				return [][]byte{pkt}
+			}
+			end -= totalPad
+		}
+		if !vbr {
+			rem := end - pos
+			if rem%m != 0 {
+				return [][]byte{pkt}
+			}
+			fLen := rem / m
+			out := make([][]byte, 0, m)
+			for i := 0; i < m; i++ {
+				start := pos + i*fLen
+				out = append(out, emitFrame(pkt[start:start+fLen]))
+			}
+			return out
+		}
+		lens := make([]int, m)
+		sum := 0
+		for i := 0; i < m-1; i++ {
+			n, ok := parseOpusFrameLength(pkt, &pos, end)
+			if !ok {
+				return [][]byte{pkt}
+			}
+			lens[i] = n
+			sum += n
+		}
+		if pos+sum > end {
+			return [][]byte{pkt}
+		}
+		lens[m-1] = (end - pos) - sum
+		out := make([][]byte, 0, m)
+		cursor := pos
+		for _, n := range lens {
+			out = append(out, emitFrame(pkt[cursor:cursor+n]))
+			cursor += n
+		}
+		return out
+	default:
+		return [][]byte{pkt}
+	}
+}
+
+func parseOpusFrameLength(pkt []byte, pos *int, end int) (int, bool) {
+	if *pos >= end {
+		return 0, false
+	}
+	b0 := int(pkt[*pos])
+	*pos++
+	if b0 < 252 {
+		return b0, true
+	}
+	if *pos >= end {
+		return 0, false
+	}
+	b1 := int(pkt[*pos])
+	*pos++
+	return b0 + 4*b1, true
+}

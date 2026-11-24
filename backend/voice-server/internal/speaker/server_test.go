@@ -47,7 +47,19 @@ func TestVoiceServerEnrollIdentifyAndStream(t *testing.T) {
 	if err != nil || resEnroll.StatusCode != http.StatusOK {
 		t.Fatalf("enroll failed: err=%v resp=%v", err, resEnroll)
 	}
+	var enrollResp struct {
+		OK        bool      `json:"ok"`
+		SpeakerID string    `json:"speaker_id"`
+		Dim       int       `json:"dim"`
+		Embedding []float32 `json:"embedding"`
+	}
+	if err := json.NewDecoder(resEnroll.Body).Decode(&enrollResp); err != nil {
+		t.Fatalf("decode enroll response failed: %v", err)
+	}
 	_ = resEnroll.Body.Close()
+	if !enrollResp.OK || enrollResp.Dim != 192 || len(enrollResp.Embedding) != 192 {
+		t.Fatalf("expected 192-D embedding in enroll response, got ok=%v dim=%d len=%d", enrollResp.OK, enrollResp.Dim, len(enrollResp.Embedding))
+	}
 
 	// HTTP identify matching Owner.
 	resID, err := http.Post(ts.URL+"/api/v1/speaker/identify?uid=u_1&agent_id=ez-assistant", "application/octet-stream", bytes.NewReader(pcmOwner))

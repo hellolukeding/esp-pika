@@ -21,12 +21,12 @@ func init() {
 	flag.StringVar(&flagconf, "conf", "../../configs/config.yaml", "config path, eg: -conf config.yaml")
 }
 
-func newApp(logger log.Logger, gs *grpc.Server, hs *http.Server, ms *server.MDNSServer) *kratos.App {
+func newApp(logger log.Logger, gs *grpc.Server, hs *http.Server, ms *server.MDNSServer, ezs *server.EZDeviceServer) *kratos.App {
 	return kratos.New(
 		kratos.Name("esp-pika-gateway"),
 		kratos.Version("v0.1.0"),
 		kratos.Logger(logger),
-		kratos.Server(gs, hs, ms),
+		kratos.Server(gs, hs, ms, ezs),
 	)
 }
 

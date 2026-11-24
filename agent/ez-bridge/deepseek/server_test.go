@@ -302,3 +302,170 @@ func TestDeepSeekCancelTurn(t *testing.T) {
 		t.Fatalf("expected cancelled turn, got %q", doneReason)
 	}
 }
+
+func TestDeepSeekDynamicSystemPromptPerTurn(t *testing.T) {
+	promptsCh := make(chan string, 4)
+	dsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatCompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode deepseek req: %v", err)
+		}
+		if len(req.Messages) > 0 && req.Messages[0].Role == "system" {
+			promptsCh <- req.Messages[0].Content
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"收到。"},"finish_reason":"stop"}]}`)
+		_, _ = fmt.Fprintln(w, `data: [DONE]`)
+	}))
+	defer dsSrv.Close()
+
+	srv, err := NewServer(Config{
+		APIKey:       "sk-test-key",
+		BaseURL:      dsSrv.URL,
+		Model:        "deepseek-chat",
+		SystemPrompt: "DEFAULT_STATIC_PROMPT",
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	client := startBufconnServer(t, srv)
+
+	runOneTurn := func(sysPrompt string) string {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		stream, err := client.Converse(ctx)
+		if err != nil {
+			t.Fatalf("Converse: %v", err)
+		}
+		if err := stream.Send(&agentv1.GatewayToAgentEvent{
+			Payload: &agentv1.GatewayToAgentEvent_SendTurn{
+				SendTurn: &agentv1.SendTurn{
+					SessionId:    "sess-dyn",
+					TurnId:       "t-1",
+					Text:         "你好",
+					SystemPrompt: sysPrompt,
+				},
+			},
+		}); err != nil {
+			t.Fatalf("SendTurn: %v", err)
+		}
+		_ = stream.CloseSend()
+		for {
+			_, err := stream.Recv()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("Recv: %v", err)
+			}
+		}
+		return <-promptsCh
+	}
+
+	if got := runOneTurn("你是一只傲娇的赛博猫咪，只用喵喵语气简短回复。"); !strings.Contains(got, "赛博猫咪") {
+		t.Fatalf("expected custom dynamic system prompt on turn 1, got %q", got)
+	}
+	if got := runOneTurn("你是一个严谨的智能家居管家。"); !strings.Contains(got, "智能家居管家") {
+		t.Fatalf("expected updated system prompt on turn 2, got %q", got)
+	}
+	if got := runOneTurn(""); got != "DEFAULT_STATIC_PROMPT" {
+		t.Fatalf("expected fallback to static default prompt when empty, got %q", got)
+	}
+}
+
+func TestDeepSeekDynamicKeyAndModelPerTurn(t *testing.T) {
+	type reqCapture struct {
+		auth  string
+		model string
+	}
+	caps := make(chan reqCapture, 2)
+	dsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatCompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode deepseek req: %v", err)
+		}
+		caps <- reqCapture{
+			auth:  r.Header.Get("Authorization"),
+			model: req.Model,
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"好的。"},"finish_reason":"stop"}]}`)
+		_, _ = fmt.Fprintln(w, `data: [DONE]`)
+	}))
+	defer dsSrv.Close()
+
+	// Empty startup APIKey must succeed so Web Console can configure it dynamically.
+	srv, err := NewServer(Config{
+		BaseURL: dsSrv.URL,
+	})
+	if err != nil {
+		t.Fatalf("NewServer without APIKey should succeed, got: %v", err)
+	}
+	client := startBufconnServer(t, srv)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// 1. Missing key both statically and per-turn returns clear error turn event.
+	streamNoKey, err := client.Converse(ctx)
+	if err != nil {
+		t.Fatalf("Converse no-key: %v", err)
+	}
+	if err := streamNoKey.Send(&agentv1.GatewayToAgentEvent{
+		Payload: &agentv1.GatewayToAgentEvent_SendTurn{
+			SendTurn: &agentv1.SendTurn{SessionId: "s1", TurnId: "t-nokey", Text: "你好"},
+		},
+	}); err != nil {
+		t.Fatalf("SendTurn no-key: %v", err)
+	}
+	_ = streamNoKey.CloseSend()
+	var errMsg string
+	for {
+		ev, err := streamNoKey.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Recv no-key: %v", err)
+		}
+		if d := ev.GetDone(); d != nil {
+			errMsg = d.GetErrorMessage()
+		}
+	}
+	if !strings.Contains(errMsg, "api_key") {
+		t.Fatalf("expected missing api_key error message, got %q", errMsg)
+	}
+
+	// 2. Providing per-turn ApiKey and Model invokes DeepSeek with those exact values.
+	streamKey, err := client.Converse(ctx)
+	if err != nil {
+		t.Fatalf("Converse with-key: %v", err)
+	}
+	if err := streamKey.Send(&agentv1.GatewayToAgentEvent{
+		Payload: &agentv1.GatewayToAgentEvent_SendTurn{
+			SendTurn: &agentv1.SendTurn{
+				SessionId: "s1",
+				TurnId:    "t-withkey",
+				Text:      "你好",
+				ApiKey:    "sk-console-dynamic-9999",
+				Model:     "deepseek-chat",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("SendTurn with-key: %v", err)
+	}
+	_ = streamKey.CloseSend()
+	for {
+		_, err := streamKey.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Recv with-key: %v", err)
+		}
+	}
+	got := <-caps
+	if got.auth != "Bearer sk-console-dynamic-9999" || got.model != "deepseek-chat" {
+		t.Fatalf("expected dynamic Bearer key & model, got %+v", got)
+	}
+}

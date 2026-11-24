@@ -39,22 +39,27 @@ func wireApp(bc *conf.Bootstrap, logger log.Logger) (*kratos.App, func(), error)
 	arbiter := bc.Arbiter
 	sessionRouter := biz.NewSessionRouter(speakerRepo)
 	voice := bc.Voice
-	agentAdapter, cleanup2, err := data.NewGRPCAgentAdapter(voice, logger)
+	grpcAgentAdapter, cleanup2, err := data.NewGRPCAgentAdapter(voice, logger)
 	if err != nil {
 		cleanup()
 		return nil, nil, err
 	}
-	asrProvider := data.NewASRProvider(voice, logger)
-	ttsProvider := data.NewTTSProvider(voice, logger)
+	settingsRepo := data.NewSQLiteSettingsRepo(dataData)
+	ezDeviceBridge := data.NewEZDeviceBridge(confServer, settingsRepo, logger)
+	agentAdapter := data.NewAgentAdapter(grpcAgentAdapter, ezDeviceBridge, logger)
+	asrProvider := data.NewASRProvider(voice, settingsRepo, ezDeviceBridge, logger)
+	ttsProvider := data.NewTTSProvider(voice, settingsRepo, ezDeviceBridge, logger)
 	voiceReviewer := data.NewVoiceReviewer(voice, logger)
 	speechPipeline := biz.NewSpeechPipeline(asrProvider, ttsProvider, voiceReviewer, speakerUsecase)
-	deviceWSHandler, cleanup3 := server.NewDeviceWSHandler(confServer, arbiter, macAuthUsecase, deviceUsecase, speakerUsecase, sessionRouter, eventBus, agentAdapter, speechPipeline, logger)
-	voiceDebugHandler := server.NewVoiceDebugHandler(voice, speakerUsecase, speechPipeline, logger)
+	settingsUsecase := biz.NewSettingsUsecase(settingsRepo, speakerUsecase)
+	deviceWSHandler, cleanup3 := server.NewDeviceWSHandler(confServer, arbiter, macAuthUsecase, deviceUsecase, speakerUsecase, sessionRouter, eventBus, agentAdapter, speechPipeline, settingsUsecase, logger)
+	voiceDebugHandler := server.NewVoiceDebugHandler(voice, speakerUsecase, speechPipeline, settingsUsecase, logger)
+	ezDeviceServer := server.NewEZDeviceServer(ezDeviceBridge, deviceUsecase, speechPipeline, logger)
 	mcpServer := server.NewMCPServer(deviceUsecase, speakerUsecase, logger)
-	httpServer := server.NewHTTPServer(confServer, gatewayAdminService, deviceWSHandler, voiceDebugHandler, mcpServer, logger)
+	httpServer := server.NewHTTPServer(confServer, gatewayAdminService, deviceWSHandler, voiceDebugHandler, ezDeviceServer, mcpServer, logger)
 	discovery := bc.Discovery
 	mdnsServer := server.NewMDNSServer(discovery, logger)
-	app := newApp(logger, grpcServer, httpServer, mdnsServer)
+	app := newApp(logger, grpcServer, httpServer, mdnsServer, ezDeviceServer)
 	return app, func() {
 		cleanup3()
 		cleanup2()

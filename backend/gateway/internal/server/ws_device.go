@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -33,6 +34,7 @@ type DeviceWSHandler struct {
 	events   biz.EventBus
 	agent    biz.AgentAdapter
 	speech   *biz.SpeechPipeline
+	settings *biz.SettingsUsecase
 	mediaDir string
 	log      *log.Helper
 
@@ -50,6 +52,7 @@ func NewDeviceWSHandler(
 	events biz.EventBus,
 	agent biz.AgentAdapter,
 	speech *biz.SpeechPipeline,
+	settings *biz.SettingsUsecase,
 	logger log.Logger,
 ) (*DeviceWSHandler, func()) {
 	window := 120 * time.Millisecond
@@ -70,6 +73,7 @@ func NewDeviceWSHandler(
 		events:   events,
 		agent:    agent,
 		speech:   speech,
+		settings: settings,
 		mediaDir: mediaDir,
 		log:      log.NewHelper(logger),
 	}
@@ -92,6 +96,8 @@ type wsSpeechState struct {
 	confidence  float32
 	agentID     string
 	grayFrames  [][]byte
+	rxFrames    int
+	rxBytes     int
 	turnCancel  context.CancelFunc
 }
 
@@ -103,6 +109,8 @@ func (s *wsSpeechState) resetASR() {
 		s.asr = nil
 	}
 	s.grayFrames = nil
+	s.rxFrames = 0
+	s.rxBytes = 0
 }
 
 func (s *wsSpeechState) cancelActiveTurn() {
@@ -201,6 +209,10 @@ func (h *DeviceWSHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 				copy(cp, data)
 				spState.grayFrames = append(spState.grayFrames, cp)
 			}
+			if asr != nil {
+				spState.rxFrames++
+				spState.rxBytes += len(data)
+			}
 			spState.mu.Unlock()
 			if asr != nil {
 				_ = asr.WriteOpusFrame(ctx, data)
@@ -296,6 +308,8 @@ func (h *DeviceWSHandler) handleTextFrame(ctx context.Context, allowed *biz.Allo
 		if zone == "" {
 			zone = allowed.Zone
 		}
+		h.log.WithContext(ctx).Infof("ws wake.detected mac=%s word=%s score=%.2f snr=%.1f",
+			allowed.MAC, msg.WakeWord, msg.WakeScore, msg.SNRDB)
 		h.arbiter.Submit(ctx, biz.WakeCandidate{
 			DeviceID:     allowed.MAC,
 			GroupID:      groupID,
@@ -314,6 +328,9 @@ func (h *DeviceWSHandler) handleTextFrame(ctx context.Context, allowed *biz.Allo
 			AgentID     string          `json:"agent_id"`
 		}
 		if err := json.Unmarshal(raw, &msg); err == nil && h.router != nil {
+			h.log.WithContext(ctx).Infof("ws speech.start mac=%s speaker=%s role=%d",
+				allowed.MAC, msg.SpeakerID, msg.SpeakerRole)
+			spState.cancelActiveTurn()
 			spState.resetASR()
 			var asrStream biz.ASRStream
 			if h.speech != nil && h.speech.ASR != nil {
@@ -326,6 +343,8 @@ func (h *DeviceWSHandler) handleTextFrame(ctx context.Context, allowed *biz.Allo
 			spState.confidence = msg.Confidence
 			spState.agentID = msg.AgentID
 			spState.grayFrames = nil
+			spState.rxFrames = 0
+			spState.rxBytes = 0
 			spState.mu.Unlock()
 
 			route := h.router.ResolveTurn(ctx, msg.SpeakerID, msg.AgentID, allowed.MAC)
@@ -347,6 +366,10 @@ func (h *DeviceWSHandler) handleTextFrame(ctx context.Context, allowed *biz.Allo
 		spState.asr = nil
 		gray := spState.grayFrames
 		spState.grayFrames = nil
+		rxFrames := spState.rxFrames
+		rxBytes := spState.rxBytes
+		spState.rxFrames = 0
+		spState.rxBytes = 0
 		speakerID := spState.speakerID
 		speakerRole := spState.speakerRole
 		confidence := spState.confidence
@@ -354,13 +377,29 @@ func (h *DeviceWSHandler) handleTextFrame(ctx context.Context, allowed *biz.Allo
 		spState.mu.Unlock()
 
 		var transcript string
+		var asrErr error
+		var asrElapsed time.Duration
 		if asr != nil {
-			transcript, _ = asr.Finish(ctx)
+			asrStart := time.Now()
+			transcript, asrErr = asr.Finish(ctx)
+			asrElapsed = time.Since(asrStart)
 			_ = asr.Close()
 		}
-		// Perform cloud gray-zone speaker verification when confidence is in [0.65, 0.85) or missing.
-		if h.speech != nil && h.speech.Reviewer != nil && len(gray) > 0 &&
-			(speakerID == "" || (confidence >= 0.65 && confidence < 0.85)) {
+		if asrErr != nil {
+			h.log.WithContext(ctx).Warnf("ws speech.stop mac=%s rx_frames=%d rx_bytes=%d asr_ms=%d asr failed: %v", allowed.MAC, rxFrames, rxBytes, asrElapsed.Milliseconds(), asrErr)
+		} else {
+			h.log.WithContext(ctx).Infof("ws speech.stop mac=%s rx_frames=%d rx_bytes=%d asr_ms=%d transcript=%q", allowed.MAC, rxFrames, rxBytes, asrElapsed.Milliseconds(), transcript)
+		}
+		// Perform cloud gray-zone speaker verification when confidence is in [0.65, 0.85) or missing
+		// (skipping blank speaker lookups when zero voiceprints are enrolled).
+		shouldReview := h.speech != nil && h.speech.Reviewer != nil && len(gray) > 0 &&
+			(speakerID == "" || (confidence >= 0.65 && confidence < 0.85))
+		if shouldReview && speakerID == "" && h.speakers != nil {
+			if list, lErr := h.speakers.List(ctx, ""); lErr == nil && len(list) == 0 {
+				shouldReview = false
+			}
+		}
+		if shouldReview {
 			if revSpk, revRole, revConf, err := h.speech.Reviewer.Review(ctx, allowed.MAC, gray); err == nil && revSpk != "" {
 				speakerID, speakerRole, confidence = revSpk, revRole, revConf
 			}
@@ -465,33 +504,287 @@ func (h *DeviceWSHandler) handleTextFrame(ctx context.Context, allowed *biz.Allo
 	return connID, true
 }
 
-func (h *DeviceWSHandler) makeAgentCallbacks(ctx context.Context, sink *wsSink, route biz.SessionRoute, turnID, speakerID string) biz.AgentStreamCallbacks {
+const pacerTargetLead = 2400 * time.Millisecond
+
+func opusFrameDuration(pkt []byte) time.Duration {
+	if len(pkt) == 0 || bytes.HasPrefix(pkt, []byte("OPUS24K:")) {
+		return 0
+	}
+	cfg := (pkt[0] >> 3) & 0x1F
+	var frameDur time.Duration
+	switch {
+	case cfg < 12:
+		frameDur = [4]time.Duration{
+			10 * time.Millisecond,
+			20 * time.Millisecond,
+			40 * time.Millisecond,
+			60 * time.Millisecond,
+		}[cfg%4]
+	case cfg < 16:
+		frameDur = [2]time.Duration{
+			10 * time.Millisecond,
+			20 * time.Millisecond,
+		}[cfg%2]
+	default:
+		frameDur = [4]time.Duration{
+			2500 * time.Microsecond,
+			5 * time.Millisecond,
+			10 * time.Millisecond,
+			20 * time.Millisecond,
+		}[cfg%4]
+	}
+
+	count := 1
+	switch pkt[0] & 0x03 {
+	case 0:
+		count = 1
+	case 1, 2:
+		count = 2
+	case 3:
+		if len(pkt) >= 2 {
+			count = int(pkt[1] & 0x3F)
+			if count < 1 {
+				count = 1
+			} else if count > 48 {
+				count = 48
+			}
+		}
+	}
+
+	total := frameDur * time.Duration(count)
+	if total < 2500*time.Microsecond {
+		return 2500 * time.Microsecond
+	}
+	if total > 120*time.Millisecond {
+		return 120 * time.Millisecond
+	}
+	return total
+}
+
+type opusBurstPacer struct {
+	mu             sync.Mutex
+	started        bool
+	deviceAudioEnd time.Time
+	lead           time.Duration
+}
+
+func (p *opusBurstPacer) effectiveLead() time.Duration {
+	if p.lead > 0 {
+		return p.lead
+	}
+	return pacerTargetLead
+}
+
+func (p *opusBurstPacer) sendAll(ctx context.Context, frames [][]byte, sendFn func([]byte) error) error {
+	lead := p.effectiveLead()
+	for _, fr := range frames {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		var wait time.Duration
+		if dur := opusFrameDuration(fr); dur > 0 {
+			p.mu.Lock()
+			now := time.Now()
+			if !p.started || now.After(p.deviceAudioEnd) {
+				p.deviceAudioEnd = now
+				p.started = true
+			}
+			p.deviceAudioEnd = p.deviceAudioEnd.Add(dur)
+			if w := time.Until(p.deviceAudioEnd.Add(-lead)); w > 0 {
+				wait = w
+			}
+			p.mu.Unlock()
+		}
+		if wait > 0 {
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+		if err := sendFn(fr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type ttsSentenceJob struct {
+	text  string
+	voice string
+}
+
+type ttsTurnPipeline struct {
+	ctx           context.Context
+	cancel        context.CancelFunc
+	speech        *biz.SpeechPipeline
+	sink          *wsSink
+	deviceID      string
+	turnID        string
+	resolvedVoice string
+	log           *log.Helper
+
+	mu         sync.Mutex
+	closed     bool
+	sendWG     sync.WaitGroup
+	sentenceCh chan ttsSentenceJob
+	batchCh    chan [][]byte
+	wg         sync.WaitGroup
+}
+
+func newTTSTurnPipeline(
+	ctx context.Context,
+	speech *biz.SpeechPipeline,
+	sink *wsSink,
+	deviceID, turnID, resolvedVoice string,
+	logHelper *log.Helper,
+) *ttsTurnPipeline {
+	pCtx, pCancel := context.WithCancel(ctx)
+	p := &ttsTurnPipeline{
+		ctx:           pCtx,
+		cancel:        pCancel,
+		speech:        speech,
+		sink:          sink,
+		deviceID:      deviceID,
+		turnID:        turnID,
+		resolvedVoice: resolvedVoice,
+		log:           logHelper,
+		sentenceCh:    make(chan ttsSentenceJob, 32),
+		batchCh:       make(chan [][]byte, 3),
+	}
+	p.wg.Add(2)
+	go p.runSynthesizer()
+	go p.runPacer()
+	return p
+}
+
+func (p *ttsTurnPipeline) runSynthesizer() {
+	defer p.wg.Done()
+	defer close(p.batchCh)
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case job, ok := <-p.sentenceCh:
+			if !ok {
+				return
+			}
+			if p.speech == nil || p.speech.TTS == nil {
+				continue
+			}
+			frames, err := p.speech.TTS.Synthesize(p.ctx, job.text, job.voice)
+			if err != nil {
+				if p.ctx.Err() == nil && p.log != nil {
+					p.log.WithContext(p.ctx).Warnf("ws tts synthesize failed mac=%s voice=%s: %v", p.deviceID, job.voice, err)
+				}
+				continue
+			}
+			if len(frames) == 0 {
+				continue
+			}
+			select {
+			case p.batchCh <- frames:
+			case <-p.ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+func (p *ttsTurnPipeline) runPacer() {
+	defer p.wg.Done()
+	pacer := &opusBurstPacer{}
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case frames, ok := <-p.batchCh:
+			if !ok {
+				return
+			}
+			if p.log != nil {
+				p.log.WithContext(p.ctx).Infof("ws tts sending mac=%s frames=%d", p.deviceID, len(frames))
+			}
+			sendStart := time.Now()
+			if err := pacer.sendAll(p.ctx, frames, func(fr []byte) error {
+				return p.sink.SendAudio(p.ctx, fr)
+			}); err != nil {
+				return
+			}
+			if p.log != nil {
+				p.log.WithContext(p.ctx).Infof("ws tts sent mac=%s frames=%d elapsed_ms=%d",
+					p.deviceID, len(frames), time.Since(sendStart).Milliseconds())
+			}
+		}
+	}
+}
+
+func (p *ttsTurnPipeline) Enqueue(spokenRaw, overrideVoice string) {
+	if p.speech == nil || p.speech.TTS == nil {
+		return
+	}
+	spoken := biz.SpokenFilter(spokenRaw)
+	if spoken == "" {
+		return
+	}
+	if p.speech.Arbitrator != nil && !p.speech.Arbitrator.Acquire(p.deviceID, p.turnID, biz.AudioPriorityConversation) {
+		return
+	}
+	v := overrideVoice
+	if v == "" {
+		v = p.resolvedVoice
+	}
+	p.mu.Lock()
+	if p.closed || p.ctx.Err() != nil {
+		p.mu.Unlock()
+		return
+	}
+	p.sendWG.Add(1)
+	p.mu.Unlock()
+
+	defer p.sendWG.Done()
+	select {
+	case p.sentenceCh <- ttsSentenceJob{text: spoken, voice: v}:
+	case <-p.ctx.Done():
+	}
+}
+
+func (p *ttsTurnPipeline) closeSentencesOnce() {
+	p.mu.Lock()
+	alreadyClosed := p.closed
+	p.closed = true
+	p.mu.Unlock()
+	if !alreadyClosed {
+		p.sendWG.Wait()
+		close(p.sentenceCh)
+	}
+}
+
+func (p *ttsTurnPipeline) Finish() {
+	p.closeSentencesOnce()
+	p.wg.Wait()
+}
+
+func (p *ttsTurnPipeline) Abort() {
+	p.cancel()
+	p.closeSentencesOnce()
+	p.wg.Wait()
+}
+
+func (h *DeviceWSHandler) makeAgentCallbacks(ctx context.Context, sink *wsSink, route biz.SessionRoute, turnID, speakerID string) (biz.AgentStreamCallbacks, func()) {
 	var chunker biz.SentenceChunker
+
 	resolvedVoice := ""
 	if h.speech != nil {
 		resolvedVoice = h.speech.ResolveSpeakerVoice(ctx, speakerID)
 	}
-	synthesizeAndSend := func(spokenRaw, overrideVoice string) {
-		if h.speech == nil || h.speech.TTS == nil {
-			return
-		}
-		spoken := biz.SpokenFilter(spokenRaw)
-		if spoken == "" {
-			return
-		}
-		if h.speech.Arbitrator != nil && !h.speech.Arbitrator.Acquire(route.SourceDeviceID, turnID, biz.AudioPriorityConversation) {
-			return
-		}
-		v := overrideVoice
-		if v == "" {
-			v = resolvedVoice
-		}
-		frames, err := h.speech.TTS.Synthesize(ctx, spoken, v)
-		if err != nil {
-			return
-		}
-		for _, fr := range frames {
-			_ = sink.SendAudio(ctx, fr)
+	ttsPipe := newTTSTurnPipeline(ctx, h.speech, sink, route.SourceDeviceID, turnID, resolvedVoice, h.log)
+	cleanup := func() {
+		ttsPipe.Abort()
+		if h.speech != nil && h.speech.Arbitrator != nil {
+			h.speech.Arbitrator.Release(route.SourceDeviceID, turnID)
 		}
 	}
 
@@ -515,7 +808,7 @@ func (h *DeviceWSHandler) makeAgentCallbacks(ctx context.Context, sink *wsSink, 
 				"tts_voice":  ttsVoice,
 			})
 			for _, sentence := range chunker.Push(chunk) {
-				synthesizeAndSend(sentence, ttsVoice)
+				ttsPipe.Enqueue(sentence, ttsVoice)
 			}
 		},
 		OnUIUpdate: func(targetDeviceID, emotion, text, cardJSON string) {
@@ -533,8 +826,9 @@ func (h *DeviceWSHandler) makeAgentCallbacks(ctx context.Context, sink *wsSink, 
 		},
 		OnDone: func(finishReason, errorMessage string) {
 			if rem := chunker.Flush(); rem != "" {
-				synthesizeAndSend(rem, "")
+				ttsPipe.Enqueue(rem, "")
 			}
+			ttsPipe.Finish()
 			if h.speech != nil && h.speech.Arbitrator != nil {
 				h.speech.Arbitrator.Release(route.SourceDeviceID, turnID)
 			}
@@ -546,7 +840,7 @@ func (h *DeviceWSHandler) makeAgentCallbacks(ctx context.Context, sink *wsSink, 
 				"error_message": errorMessage,
 			})
 		},
-	}
+	}, cleanup
 }
 
 func (h *DeviceWSHandler) dispatchAgentTurn(
@@ -561,6 +855,14 @@ func (h *DeviceWSHandler) dispatchAgentTurn(
 ) {
 	sh, _ := h.devices.GetShadow(ctx, allowed.MAC)
 	fleetJSON, _ := h.devices.FleetTopologyJSON(ctx, allowed.GroupID)
+	sysPrompt := ""
+	apiKey := ""
+	model := ""
+	if h.settings != nil {
+		sysPrompt = h.settings.ResolveTurnPrompt(ctx, speakerID)
+		apiKey = h.settings.ResolveDeepSeekAPIKey(ctx)
+		model = h.settings.ResolveDeepSeekModel(ctx)
+	}
 	req := &biz.AgentTurnRequest{
 		SessionID:        route.SessionID,
 		TurnID:           turnID,
@@ -574,6 +876,9 @@ func (h *DeviceWSHandler) dispatchAgentTurn(
 		Zone:             allowed.Zone,
 		Shadow:           sh,
 		FleetSummaryJSON: fleetJSON,
+		SystemPrompt:     sysPrompt,
+		APIKey:           apiKey,
+		Model:            model,
 	}
 	turnCtx, turnCancel := context.WithCancel(ctx)
 	if spState != nil {
@@ -582,11 +887,12 @@ func (h *DeviceWSHandler) dispatchAgentTurn(
 		spState.turnCancel = turnCancel
 		spState.mu.Unlock()
 	}
-	cb := h.makeAgentCallbacks(turnCtx, sink, route, turnID, speakerID)
+	cb, cleanupTTS := h.makeAgentCallbacks(turnCtx, sink, route, turnID, speakerID)
 	h.wg.Add(1)
 	go func() {
 		defer h.wg.Done()
 		defer turnCancel()
+		defer cleanupTTS()
 		if err := h.agent.RunTurn(turnCtx, req, cb); err != nil {
 			h.log.WithContext(turnCtx).Warnf("agent turn failed session=%s turn=%s: %v", route.SessionID, turnID, err)
 			_ = sink.SendJSON(ctx, map[string]any{
@@ -617,10 +923,11 @@ func (h *DeviceWSHandler) dispatchAgentEvent(
 		PayloadJSON:    payloadJSON,
 		OccurredAt:     time.Now(),
 	}
-	cb := h.makeAgentCallbacks(ctx, sink, route, "", "")
+	cb, cleanupTTS := h.makeAgentCallbacks(ctx, sink, route, "", "")
 	h.wg.Add(1)
 	go func() {
 		defer h.wg.Done()
+		defer cleanupTTS()
 		if err := h.agent.SendEvent(ctx, evt, cb); err != nil {
 			h.log.WithContext(ctx).Warnf("agent event failed session=%s event=%s: %v", route.SessionID, eventType, err)
 		}

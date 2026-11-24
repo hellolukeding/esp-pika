@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 // AudioPriority defines speaker playback preemption levels per architecture.md §8.3.3.
@@ -137,14 +138,43 @@ func (c *SentenceChunker) Flush() string {
 }
 
 func findSentenceCut(s string) int {
-	for i, r := range s {
-		switch r {
-		case '。', '！', '？', '.', '!', '?', '\n', '；', ';':
-			return i + len(string(r))
+	runeCount := 0
+	lastClauseCut := 0
+	var prevRune rune
+	for i := 0; i < len(s); {
+		r, w := utf8.DecodeRuneInString(s[i:])
+		runeCount++
+		nextIdx := i + w
+		if runeCount >= 6 {
+			switch r {
+			case '。', '！', '？', '!', '?', '；', ';', '\n':
+				return nextIdx
+			case '.':
+				if nextIdx < len(s) {
+					nr, _ := utf8.DecodeRuneInString(s[nextIdx:])
+					isASCIIAlnum := (nr >= '0' && nr <= '9') || (nr >= 'a' && nr <= 'z') || (nr >= 'A' && nr <= 'Z')
+					if !isASCIIAlnum {
+						return nextIdx
+					}
+				} else if prevRune < '0' || prevRune > '9' {
+					return nextIdx
+				}
+			}
 		}
-	}
-	if len(s) >= 180 {
-		return len(s)
+		if runeCount >= 18 {
+			switch r {
+			case '，', ',', '、', '：', ':':
+				lastClauseCut = nextIdx
+			}
+		}
+		if runeCount >= 65 && lastClauseCut > 0 {
+			return lastClauseCut
+		}
+		if runeCount >= 100 {
+			return nextIdx
+		}
+		prevRune = r
+		i = nextIdx
 	}
 	return -1
 }

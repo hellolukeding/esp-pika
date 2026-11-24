@@ -87,6 +87,7 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		"ok":         true,
 		"speaker_id": req.SpeakerID,
 		"dim":        len(vec),
+		"embedding":  vec,
 	})
 }
 

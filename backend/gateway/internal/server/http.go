@@ -19,6 +19,7 @@ func NewHTTPServer(
 	admin *service.GatewayAdminService,
 	ws *DeviceWSHandler,
 	voiceDbg *VoiceDebugHandler,
+	ezDevice *EZDeviceServer,
 	mcp *MCPServer,
 	logger log.Logger,
 ) *khttp.Server {
@@ -49,6 +50,16 @@ func NewHTTPServer(
 		srv.HandleFunc("/api/v1/voice/enroll", voiceDbg.HandleEnroll)
 		srv.HandleFunc("/api/v1/voice/identify", voiceDbg.HandleIdentify)
 		srv.HandleFunc("/api/v1/voice/transcribe", voiceDbg.HandleTranscribe)
+		srv.HandleFunc("/api/v1/settings/prompt", voiceDbg.HandleSystemPrompt)
+		srv.HandleFunc("/api/v1/settings/deepseek", voiceDbg.HandleDeepSeekSettings)
+	}
+	if ezDevice != nil {
+		srv.HandleFunc("/api/v1/ezdevice/status", ezDevice.HandleStatus)
+		srv.HandleFunc("/api/v1/ezdevice/discover", ezDevice.HandleDiscover)
+		srv.HandleFunc("/api/v1/ezdevice/mode", ezDevice.HandleMode)
+		srv.HandleFunc("/api/v1/ezdevice/pair", ezDevice.HandlePair)
+		srv.HandleFunc("/api/v1/ezdevice/reset", ezDevice.HandleReset)
+		srv.HandleFunc("/api/v1/ezdevice/test", ezDevice.HandleTestTurn)
 	}
 	srv.HandlePrefix("/media/", stdhttp.StripPrefix("/media/", stdhttp.FileServer(stdhttp.Dir(ws.MediaDir()))))
 	srv.Handle("/mcp", mcp)

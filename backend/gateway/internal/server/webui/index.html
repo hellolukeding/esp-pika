@@ -206,6 +206,112 @@
           <img id="cmd-media-img" class="media-preview" style="display:none;" alt="Device Media Preview" />
         </div>
       </div>
+
+      <div class="card">
+        <div class="row" style="justify-content:space-between; align-items:center;">
+          <h2 style="margin:0;">全局系统提示词 (System Prompt)</h2>
+          <span class="pill" id="global-prompt-status">加载中...</span>
+        </div>
+        <form id="global-prompt-form">
+          <div class="row">
+            <label>Agent 全局系统人设 / 提示词（留空保存即恢复默认；下一轮对话立即生效，若命中说话人声纹会追加专属 `prompt`）
+              <textarea id="global-prompt-input" rows="5" placeholder="输入全局系统提示词（例如：你是一只住在书房里的可爱电子宠物……）"></textarea>
+            </label>
+          </div>
+          <div class="row" style="align-items:center;">
+            <button class="btn" type="submit">保存提示词</button>
+            <button class="btn sec" type="button" id="global-prompt-reset-btn">恢复默认</button>
+          </div>
+        </form>
+      </div>
+
+      <div class="card">
+        <div class="row" style="justify-content:space-between; align-items:center;">
+          <h2 style="margin:0;">EZ Assistant 桌面端接入 (Device Protocol 1.0)</h2>
+          <div class="row" style="margin:0; align-items:center; gap:8px;">
+            <span class="pill" id="ezdevice-backend-pill">当前通道: -</span>
+            <span class="pill" id="ezdevice-status-pill">检测中...</span>
+          </div>
+        </div>
+        <div class="row">
+          <label>Agent 路由模式
+            <select id="ezdevice-mode">
+              <option value="auto">auto（推荐：EZ 在线优先，离线回退 DeepSeek）</option>
+              <option value="ez_device">ez_device（仅桌面 EZ Assistant）</option>
+              <option value="grpc">grpc（仅内置 ez-bridge / DeepSeek）</option>
+            </select>
+          </label>
+          <button class="btn sec" type="button" id="ezdevice-mode-save-btn">应用模式</button>
+          <button class="btn" type="button" id="ezdevice-scan-btn">扫描局域网 EZ Assistant</button>
+        </div>
+
+        <div id="ezdevice-hosts-list" style="margin-bottom:12px;"></div>
+
+        <div id="ezdevice-code-box" style="display:none; background:rgba(59,130,246,0.12); border:1px solid rgba(59,130,246,0.45); border-radius:8px; padding:12px 14px; margin-bottom:12px;">
+          <div id="ezdevice-code-prompt" style="font-size:12px; color:var(--muted); margin-bottom:4px;">请在 Mac EZ Assistant 桌面端 → 设置 → 智能终端 → 开启「设备接入」并点击「添加设备」，然后在候选设备中输入下方 6 位数字配对码：</div>
+          <div id="ezdevice-code-value" style="font-family:var(--mono); font-size:28px; font-weight:700; letter-spacing:8px; color:#93c5fd;">------</div>
+          <div id="ezdevice-code-meta" style="font-size:12px; color:var(--muted); margin-top:4px;">等待确认中...</div>
+        </div>
+
+        <form id="ezdevice-pair-form">
+          <div class="row">
+            <label>桌面端 WSS 地址 (`host:port`)
+              <input id="ezdevice-addr" placeholder="192.168.101.12:54321" required />
+            </label>
+            <label>Installation ID (32 hex)
+              <input id="ezdevice-install-id" placeholder="0123456789abcdef0123456789abcdef" required />
+            </label>
+          </div>
+          <div class="row">
+            <label>证书 SHA-256 指纹 (64 hex)
+              <input id="ezdevice-cert-fp" placeholder="64位小写 SHA-256 指纹（扫描局域网后自动填充）" required />
+            </label>
+            <label>网关终端显示名称
+              <input id="ezdevice-display-name" value="ESP-Pika Gateway" />
+            </label>
+          </div>
+          <div class="row" style="align-items:center;">
+            <button class="btn" type="submit" id="ezdevice-pair-btn">发起配对</button>
+            <button class="btn sec" type="button" id="ezdevice-test-btn">发送测试消息到 EZ Assistant（并播报）</button>
+            <button class="btn danger" type="button" id="ezdevice-reset-btn">断开 / 重置配对</button>
+            <span id="ezdevice-info-line" style="font-size:12px; color:var(--muted);"></span>
+          </div>
+        </form>
+        <div style="font-size:12px; color:var(--muted); margin-top:6px;">
+          可选反向控制硬件（MCP Streamable HTTP）：<code id="ezdevice-mcp-url">http://192.168.101.7:8088/mcp</code>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row" style="justify-content:space-between; align-items:center;">
+          <h2 style="margin:0;">DeepSeek API 配置</h2>
+          <span class="pill" id="deepseek-key-status">加载中...</span>
+        </div>
+        <form id="deepseek-settings-form">
+          <div class="row">
+            <label>DeepSeek API Key（控制台保存即写入数据库并即时生效，用于 ASR / Chat / TTS，无需改环境变量）
+              <input id="deepseek-api-key" type="password" autocomplete="off" placeholder="输入 sk-... 保存；留空则保持当前 Key 不变" />
+            </label>
+            <label>对话模型 (`model`)
+              <input id="deepseek-model" list="deepseek-model-options" placeholder="deepseek-flash" />
+              <datalist id="deepseek-model-options">
+                <option value="deepseek-flash"></option>
+                <option value="deepseek-chat"></option>
+              </datalist>
+            </label>
+            <label>TTS 音色 (`tts_voice`)
+              <select id="deepseek-voice">
+                <option value="stella">stella（女声）</option>
+                <option value="tide">tide（男声）</option>
+              </select>
+            </label>
+          </div>
+          <div class="row" style="align-items:center;">
+            <button class="btn" type="submit">保存 DeepSeek 配置</button>
+            <button class="btn sec" type="button" id="deepseek-clear-key-btn">清除已存 Key</button>
+          </div>
+        </form>
+      </div>
     </section>
 
     <!-- MAC Whitelist -->
@@ -335,7 +441,7 @@
       <div class="card">
         <h2>已配置声纹组</h2>
         <table>
-          <thead><tr><th>Speaker ID</th><th>Name</th><th>Role</th><th>Agent</th><th>TTS Voice</th><th>Version</th><th>操作</th></tr></thead>
+          <thead><tr><th>Speaker ID</th><th>Name</th><th>Role</th><th>Agent</th><th>TTS Voice</th><th>Prompt</th><th>Version</th><th>操作</th></tr></thead>
           <tbody id="speakers-tbody"></tbody>
         </table>
       </div>

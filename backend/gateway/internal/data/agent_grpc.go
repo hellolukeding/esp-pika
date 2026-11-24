@@ -29,7 +29,7 @@ type GRPCAgentAdapter struct {
 }
 
 // NewGRPCAgentAdapter constructs a gRPC AgentAdapter connected lazily to conf.Voice.AgentGrpcAddr.
-func NewGRPCAgentAdapter(c *conf.Voice, logger log.Logger) (biz.AgentAdapter, func(), error) {
+func NewGRPCAgentAdapter(c *conf.Voice, logger log.Logger) (*GRPCAgentAdapter, func(), error) {
 	helper := log.NewHelper(logger)
 	addr := ""
 	if c != nil {
@@ -92,6 +92,9 @@ func (a *GRPCAgentAdapter) RunTurn(ctx context.Context, req *biz.AgentTurnReques
 				Zone:             req.Zone,
 				ShadowSnapshot:   shadowPB,
 				FleetSummaryJson: req.FleetSummaryJSON,
+				SystemPrompt:     req.SystemPrompt,
+				ApiKey:           req.APIKey,
+				Model:            req.Model,
 			},
 		},
 	}
@@ -207,5 +210,104 @@ func (a *GRPCAgentAdapter) streamSingleExchange(
 			}
 			return nil
 		}
+	}
+}
+
+// RoutingAgentAdapter routes turns dynamically between the LAN EZ Assistant Device Protocol bridge and gRPC ez-bridge.
+type RoutingAgentAdapter struct {
+	grpc     *GRPCAgentAdapter
+	ezBridge biz.EZDeviceBridge
+	log      *log.Helper
+
+	mu          sync.Mutex
+	turnBackend map[string]string
+}
+
+// NewAgentAdapter constructs the primary biz.AgentAdapter wired into Gateway transport handlers.
+func NewAgentAdapter(grpcAdapter *GRPCAgentAdapter, ezBridge biz.EZDeviceBridge, logger log.Logger) biz.AgentAdapter {
+	return &RoutingAgentAdapter{
+		grpc:        grpcAdapter,
+		ezBridge:    ezBridge,
+		log:         log.NewHelper(logger),
+		turnBackend: make(map[string]string),
+	}
+}
+
+func (r *RoutingAgentAdapter) RunTurn(ctx context.Context, req *biz.AgentTurnRequest, cb biz.AgentStreamCallbacks) error {
+	backend, adapter, err := r.selectForTurn(ctx)
+	if err != nil {
+		return err
+	}
+	if req != nil {
+		key := req.SessionID + ":" + req.TurnID
+		r.mu.Lock()
+		r.turnBackend[key] = backend
+		r.mu.Unlock()
+		defer func() {
+			r.mu.Lock()
+			delete(r.turnBackend, key)
+			r.mu.Unlock()
+		}()
+	}
+	return adapter.RunTurn(ctx, req, cb)
+}
+
+func (r *RoutingAgentAdapter) SendEvent(ctx context.Context, evt *biz.AgentDeviceEvent, cb biz.AgentStreamCallbacks) error {
+	if r.grpc != nil {
+		return r.grpc.SendEvent(ctx, evt, cb)
+	}
+	return nil
+}
+
+func (r *RoutingAgentAdapter) CancelTurn(ctx context.Context, sessionID, turnID, reason string) error {
+	key := sessionID + ":" + turnID
+	r.mu.Lock()
+	backend := r.turnBackend[key]
+	r.mu.Unlock()
+
+	switch backend {
+	case biz.EZModeDevice:
+		if r.ezBridge != nil {
+			return r.ezBridge.CancelTurn(ctx, sessionID, turnID, reason)
+		}
+	case biz.EZModeGRPC:
+		if r.grpc != nil {
+			return r.grpc.CancelTurn(ctx, sessionID, turnID, reason)
+		}
+	default:
+		if r.ezBridge != nil && r.ezBridge.IsOnline() {
+			_ = r.ezBridge.CancelTurn(ctx, sessionID, turnID, reason)
+		}
+		if r.grpc != nil {
+			return r.grpc.CancelTurn(ctx, sessionID, turnID, reason)
+		}
+	}
+	return nil
+}
+
+func (r *RoutingAgentAdapter) selectForTurn(ctx context.Context) (string, biz.AgentAdapter, error) {
+	mode := biz.EZModeAuto
+	if r.ezBridge != nil {
+		mode = r.ezBridge.EffectiveMode(ctx)
+	}
+	switch mode {
+	case biz.EZModeDevice:
+		if r.ezBridge == nil || !r.ezBridge.IsOnline() {
+			return "", nil, fmt.Errorf("ez-assistant device bridge is not online (mode=ez_device)")
+		}
+		return biz.EZModeDevice, r.ezBridge, nil
+	case biz.EZModeGRPC:
+		if r.grpc == nil {
+			return "", nil, fmt.Errorf("grpc agent adapter is not configured (mode=grpc)")
+		}
+		return biz.EZModeGRPC, r.grpc, nil
+	default:
+		if r.ezBridge != nil && r.ezBridge.IsOnline() {
+			return biz.EZModeDevice, r.ezBridge, nil
+		}
+		if r.grpc != nil {
+			return biz.EZModeGRPC, r.grpc, nil
+		}
+		return "", nil, fmt.Errorf("no agent adapter available")
 	}
 }

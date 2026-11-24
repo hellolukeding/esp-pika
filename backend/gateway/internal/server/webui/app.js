@@ -92,6 +92,21 @@ async function refreshMacs() {
   const tbody = document.getElementById("macs-tbody");
   const res = await api("/api/v1/macs");
   const items = res.items || [];
+  const firstEnabled = items.find((m) => m.enabled);
+  if (firstEnabled) {
+    const wsMacInput = document.getElementById("ws-mac");
+    const wsZoneInput = document.getElementById("ws-zone");
+    const cmdDevInput = document.getElementById("cmd-device");
+    if (wsMacInput && (!wsMacInput.value.trim() || wsMacInput.value.trim() === "30:ed:a0:f3:dc:70")) {
+      wsMacInput.value = firstEnabled.mac;
+      if (wsZoneInput && firstEnabled.zone) {
+        wsZoneInput.value = firstEnabled.zone;
+      }
+    }
+    if (cmdDevInput && !cmdDevInput.value.trim()) {
+      cmdDevInput.value = firstEnabled.mac;
+    }
+  }
   tbody.innerHTML = items
     .map((m) => {
       const group = pick(m, "groupId", "group_id") || "";
@@ -152,17 +167,80 @@ async function refreshSpeakers() {
       const name = pick(s, "displayName", "display_name") || "";
       const agent = pick(s, "agentId", "agent_id") || "";
       const voice = pick(s, "ttsVoice", "tts_voice") || "";
+      const rawPrompt = pick(s, "prompt") || "";
+      const prompt = String(rawPrompt).replace(/[&<>"]/g, (ch) => (
+        { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]
+      ));
       return `<tr>
         <td><code>${id}</code></td>
         <td>${name}</td>
         <td>${s.role}</td>
         <td>${agent}</td>
         <td><code>${voice}</code></td>
+        <td>${prompt}</td>
         <td>${s.version || 0}</td>
         <td><button class="btn danger" onclick="deleteSpeaker('${id}')">删除</button></td>
       </tr>`;
     })
     .join("");
+}
+
+async function refreshPrompt() {
+  const input = document.getElementById("global-prompt-input");
+  const pill = document.getElementById("global-prompt-status");
+  if (!input || !pill) return;
+  try {
+    const res = await api("/api/v1/settings/prompt");
+    const custom = pick(res, "system_prompt") || "";
+    const effective = pick(res, "effective_prompt") || pick(res, "default_prompt") || "";
+    input.value = custom || effective;
+    pill.textContent = custom ? "已启用自定义提示词" : "使用默认提示词";
+    pill.className = custom ? "pill ok" : "pill";
+  } catch (err) {
+    pill.textContent = `加载失败: ${err.message}`;
+    pill.className = "pill err";
+  }
+}
+
+function applyDeepSeekView(res) {
+  const pill = document.getElementById("deepseek-key-status");
+  const keyEl = document.getElementById("deepseek-api-key");
+  const modelEl = document.getElementById("deepseek-model");
+  const voiceEl = document.getElementById("deepseek-voice");
+  if (!pill || !keyEl || !modelEl || !voiceEl) return;
+
+  const configured = Boolean(pick(res, "configured"));
+  const masked = pick(res, "masked_key") || "";
+  const source = pick(res, "source") || "none";
+  const model = pick(res, "model") || "deepseek-flash";
+  const voice = pick(res, "tts_voice") || "stella";
+
+  modelEl.value = model;
+  voiceEl.value = voice;
+  keyEl.value = "";
+
+  if (configured && source === "console") {
+    pill.textContent = `已配置 (控制台) ${masked}`;
+    pill.className = "pill ok";
+  } else if (configured && source === "env") {
+    pill.textContent = `已配置 (环境变量) ${masked}`;
+    pill.className = "pill ok";
+  } else {
+    pill.textContent = "未配置";
+    pill.className = "pill";
+  }
+}
+
+async function refreshDeepSeekSettings() {
+  const pill = document.getElementById("deepseek-key-status");
+  if (!pill) return;
+  try {
+    const res = await api("/api/v1/settings/deepseek");
+    applyDeepSeekView(res);
+  } catch (err) {
+    pill.textContent = `加载失败: ${err.message}`;
+    pill.className = "pill err";
+  }
 }
 
 window.deleteSpeaker = async (id) => {
@@ -585,8 +663,344 @@ document.getElementById("vp-ws-send-btn").addEventListener("click", () => {
   logEl.textContent = "已通过 WebSocket 发送 speech.start → 音频帧 → speech.stop，请在“WebSocket 实时调试”查看响应。";
 });
 
+document.getElementById("global-prompt-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const input = document.getElementById("global-prompt-input");
+  const pill = document.getElementById("global-prompt-status");
+  try {
+    const res = await api("/api/v1/settings/prompt", {
+      method: "PUT",
+      body: JSON.stringify({ system_prompt: input.value }),
+    });
+    const custom = pick(res, "system_prompt") || "";
+    const effective = pick(res, "effective_prompt") || pick(res, "default_prompt") || "";
+    input.value = custom || effective;
+    pill.textContent = custom ? "已保存自定义提示词" : "已恢复默认提示词";
+    pill.className = "pill ok";
+  } catch (err) {
+    pill.textContent = `保存失败: ${err.message}`;
+    pill.className = "pill err";
+  }
+});
+
+document.getElementById("global-prompt-reset-btn")?.addEventListener("click", async () => {
+  const input = document.getElementById("global-prompt-input");
+  const pill = document.getElementById("global-prompt-status");
+  try {
+    const res = await api("/api/v1/settings/prompt", {
+      method: "PUT",
+      body: JSON.stringify({ system_prompt: "" }),
+    });
+    input.value = pick(res, "effective_prompt") || pick(res, "default_prompt") || "";
+    pill.textContent = "已恢复默认提示词";
+    pill.className = "pill";
+  } catch (err) {
+    pill.textContent = `重置失败: ${err.message}`;
+    pill.className = "pill err";
+  }
+});
+
+document.getElementById("deepseek-settings-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const pill = document.getElementById("deepseek-key-status");
+  const apiKey = document.getElementById("deepseek-api-key").value.trim();
+  const model = document.getElementById("deepseek-model").value.trim();
+  const ttsVoice = document.getElementById("deepseek-voice").value;
+  try {
+    const res = await api("/api/v1/settings/deepseek", {
+      method: "PUT",
+      body: JSON.stringify({
+        api_key: apiKey,
+        model,
+        tts_voice: ttsVoice,
+      }),
+    });
+    applyDeepSeekView(res);
+  } catch (err) {
+    if (pill) {
+      pill.textContent = `保存失败: ${err.message}`;
+      pill.className = "pill err";
+    }
+  }
+});
+
+document.getElementById("deepseek-clear-key-btn")?.addEventListener("click", async () => {
+  const pill = document.getElementById("deepseek-key-status");
+  try {
+    const res = await api("/api/v1/settings/deepseek", {
+      method: "PUT",
+      body: JSON.stringify({
+        clear_key: true,
+        model: document.getElementById("deepseek-model").value.trim(),
+        tts_voice: document.getElementById("deepseek-voice").value,
+      }),
+    });
+    applyDeepSeekView(res);
+  } catch (err) {
+    if (pill) {
+      pill.textContent = `清除失败: ${err.message}`;
+      pill.className = "pill err";
+    }
+  }
+});
+
+let ezPollTimer = null;
+
+function escHtml(s) {
+  return String(s ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function applyEZDeviceStatus(res) {
+  const st = res?.status || res || {};
+  const mcpEl = document.getElementById("ezdevice-mcp-url");
+  if (mcpEl && res?.mcp_endpoint) {
+    mcpEl.textContent = res.mcp_endpoint;
+  } else if (mcpEl && window.location?.origin) {
+    mcpEl.textContent = `${window.location.origin}/mcp`;
+  }
+
+  const modeEl = document.getElementById("ezdevice-mode");
+  if (modeEl && st.mode && document.activeElement !== modeEl) {
+    modeEl.value = st.mode;
+  }
+
+  const backendPill = document.getElementById("ezdevice-backend-pill");
+  if (backendPill) {
+    backendPill.textContent = `当前通道: ${st.active_backend || "-"}`;
+    backendPill.className = st.active_backend === "ez_device" ? "pill ok" : "pill";
+  }
+
+  const statusPill = document.getElementById("ezdevice-status-pill");
+  const stateLabels = {
+    unpaired: ["未配对", "pill"],
+    pairing: ["正在连接桌面端...", "pill"],
+    awaiting_code: ["等待桌面端输入配对码", "pill"],
+    awaiting_confirm: ["等待桌面端点击确认", "pill"],
+    connecting: ["正在重连桌面端...", "pill"],
+    online: ["EZ Assistant 已在线", "pill ok"],
+    offline: ["已停用（仅 gRPC 模式）", "pill"],
+    revoked: ["已被桌面端撤销，请重新配对", "pill err"],
+    auth_error: ["认证失败，请重置配对", "pill err"],
+  };
+  if (statusPill) {
+    const [label, cls] = stateLabels[st.state] || [st.state || "未知", "pill"];
+    statusPill.textContent = label;
+    statusPill.className = cls;
+  }
+
+  const addrEl = document.getElementById("ezdevice-addr");
+  const idEl = document.getElementById("ezdevice-install-id");
+  const fpEl = document.getElementById("ezdevice-cert-fp");
+  const nameEl = document.getElementById("ezdevice-display-name");
+  if (addrEl && (!addrEl.value || st.state === "pairing" || st.state === "awaiting_code" || st.state === "awaiting_confirm") && st.host_address && document.activeElement !== addrEl) {
+    addrEl.value = st.host_address;
+  }
+  if (idEl && !idEl.value && st.installation_id) idEl.value = st.installation_id;
+  if (fpEl && !fpEl.value && st.certificate_fingerprint) fpEl.value = st.certificate_fingerprint;
+  if (nameEl && !nameEl.value && st.display_name) nameEl.value = st.display_name;
+
+  const codeBox = document.getElementById("ezdevice-code-box");
+  const codePrompt = document.getElementById("ezdevice-code-prompt");
+  const codeVal = document.getElementById("ezdevice-code-value");
+  const codeMeta = document.getElementById("ezdevice-code-meta");
+  if (codeBox && codeVal && codeMeta) {
+    if ((st.pairing_mode === "direct_confirm" || st.state === "awaiting_confirm") && (st.state === "pairing" || st.state === "awaiting_confirm")) {
+      codeBox.style.display = "block";
+      if (codePrompt) {
+        codePrompt.textContent = "免码确认模式：请在 Mac EZ Assistant 桌面端 → 设置 → 智能终端 中核对下方密钥指纹并点击「确认配对」：";
+      }
+      codeVal.textContent = st.key_fingerprint || "生成中...";
+      codeMeta.textContent = st.state === "awaiting_confirm"
+        ? "Host 已将网关加入候选列表，请点击桌面端「确认配对」（无需输入配对码）"
+        : "正在向桌面端发送免码配对申请...";
+    } else if (st.pairing_code && (st.state === "pairing" || st.state === "awaiting_code")) {
+      codeBox.style.display = "block";
+      if (codePrompt) {
+        codePrompt.textContent = "请在 Mac EZ Assistant 桌面端 → 设置 → 智能终端 → 开启「设备接入」并点击「添加设备」，然后在候选设备中输入下方 6 位数字配对码：";
+      }
+      codeVal.textContent = st.pairing_code;
+      const expText = st.pairing_expires_at_ms
+        ? `有效期至 ${new Date(st.pairing_expires_at_ms).toLocaleTimeString()}`
+        : "等待桌面端确认...";
+      codeMeta.textContent = st.state === "awaiting_code" ? `Host 已就绪（${expText}）` : "正在发送 pairing_hello...";
+    } else {
+      codeBox.style.display = "none";
+      codeVal.textContent = "------";
+    }
+  }
+
+  const infoLine = document.getElementById("ezdevice-info-line");
+  if (infoLine) {
+    const parts = [];
+    if (st.device_id) parts.push(`device_id=${st.device_id}`);
+    if (st.identity_state) parts.push(`identity=${st.identity_state}`);
+    if (st.last_error) parts.push(`状态提示: ${st.last_error}`);
+    infoLine.textContent = parts.join(" | ");
+    infoLine.style.color = st.last_error && st.state === "unpaired" ? "var(--err)" : "var(--muted)";
+  }
+
+  const shouldPoll = st.state === "pairing" || st.state === "awaiting_code" || st.state === "awaiting_confirm" || st.state === "connecting";
+  if (shouldPoll && !ezPollTimer) {
+    ezPollTimer = setInterval(refreshEZDeviceStatus, 2000);
+  } else if (!shouldPoll && ezPollTimer) {
+    clearInterval(ezPollTimer);
+    ezPollTimer = null;
+  }
+}
+
+async function refreshEZDeviceStatus() {
+  try {
+    const res = await api("/api/v1/ezdevice/status");
+    applyEZDeviceStatus(res);
+  } catch (err) {
+    const pill = document.getElementById("ezdevice-status-pill");
+    if (pill) {
+      pill.textContent = `状态获取失败: ${err.message}`;
+      pill.className = "pill err";
+    }
+  }
+}
+
+let selectedEZPairingMode = "auto";
+function inferEZPairingMode(modes) {
+  if (!Array.isArray(modes) || modes.length === 0) return "auto";
+  if (modes.includes("direct_confirm")) return "direct_confirm";
+  if (modes.includes("spake2")) return "spake2";
+  return "auto";
+}
+
+function selectDiscoveredEZHost(addr, installID, certFP, mode) {
+  const addrEl = document.getElementById("ezdevice-addr");
+  const idEl = document.getElementById("ezdevice-install-id");
+  const fpEl = document.getElementById("ezdevice-cert-fp");
+  if (addrEl) addrEl.value = addr;
+  if (idEl) idEl.value = installID;
+  if (fpEl) fpEl.value = certFP;
+  selectedEZPairingMode = mode || "auto";
+}
+window.selectDiscoveredEZHost = selectDiscoveredEZHost;
+["ezdevice-addr", "ezdevice-install-id", "ezdevice-cert-fp"].forEach((id) => {
+  document.getElementById(id)?.addEventListener("input", () => {
+    selectedEZPairingMode = "auto";
+  });
+});
+
+document.getElementById("ezdevice-scan-btn")?.addEventListener("click", async () => {
+  const listEl = document.getElementById("ezdevice-hosts-list");
+  if (listEl) listEl.innerHTML = `<div class="pill">正在扫描局域网 _ez-assistant._tcp.local. ...</div>`;
+  try {
+    const res = await api("/api/v1/ezdevice/discover", { method: "POST" });
+    const hosts = res.hosts || [];
+    if (hosts.length === 0) {
+      listEl.innerHTML = `<div class="pill">未扫描到开启设备接入的 EZ Assistant 桌面端（请确认桌面端已启动且与网关同处局域网，也可手动填写上方参数）</div>`;
+      return;
+    }
+    listEl.innerHTML = hosts
+      .map((h) => {
+        const primaryAddr = `${(h.addresses || [])[0] || h.host_name}:${h.port}`;
+        const hostMode = inferEZPairingMode(h.pairing_modes);
+        const modeLabel = (h.pairing_modes || []).includes("direct_confirm")
+          ? "免码确认"
+          : (h.pairing_modes || []).includes("spake2")
+            ? "6位配对码"
+            : "";
+        return `
+          <div class="row" style="background:var(--panel-alt); border:1px solid var(--border); border-radius:6px; padding:8px 10px; align-items:center; justify-content:space-between; margin-bottom:6px;">
+            <div style="font-size:12px;">
+              <strong>${escHtml(h.instance_name || h.host_name)}</strong>
+              <span class="tag ${h.pairing_available ? "online" : ""}">${h.pairing_available ? "开放配对" : "仅重连"}</span>
+              ${modeLabel ? `<span class="tag">${escHtml(modeLabel)}</span>` : ""}
+              <code>${escHtml(primaryAddr)}</code>
+              <span style="color:var(--muted);">install=${escHtml(h.installation_id.slice(0, 12))}...</span>
+            </div>
+            <button class="btn sec" type="button" onclick="selectDiscoveredEZHost('${escHtml(primaryAddr)}','${escHtml(h.installation_id)}','${escHtml(h.certificate_fingerprint)}','${escHtml(hostMode)}')">选中此主机</button>
+          </div>`;
+      })
+      .join("");
+    if (hosts.length >= 1) {
+      const first = hosts[0];
+      const firstAddr = `${(first.addresses || [])[0] || first.host_name}:${first.port}`;
+      selectDiscoveredEZHost(firstAddr, first.installation_id, first.certificate_fingerprint, inferEZPairingMode(first.pairing_modes));
+    }
+  } catch (err) {
+    if (listEl) listEl.innerHTML = `<div class="pill err">扫描失败: ${escHtml(err.message)}</div>`;
+  }
+});
+
+document.getElementById("ezdevice-mode-save-btn")?.addEventListener("click", async () => {
+  const mode = document.getElementById("ezdevice-mode")?.value || "auto";
+  try {
+    const res = await api("/api/v1/ezdevice/mode", {
+      method: "PUT",
+      body: JSON.stringify({ mode }),
+    });
+    applyEZDeviceStatus(res);
+  } catch (err) {
+    const infoLine = document.getElementById("ezdevice-info-line");
+    if (infoLine) infoLine.textContent = `切换模式失败: ${err.message}`;
+  }
+});
+
+document.getElementById("ezdevice-pair-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const infoLine = document.getElementById("ezdevice-info-line");
+  try {
+    const res = await api("/api/v1/ezdevice/pair", {
+      method: "POST",
+      body: JSON.stringify({
+        address: document.getElementById("ezdevice-addr").value.trim(),
+        path: "/device",
+        installation_id: document.getElementById("ezdevice-install-id").value.trim(),
+        certificate_fingerprint: document.getElementById("ezdevice-cert-fp").value.trim(),
+        display_name: document.getElementById("ezdevice-display-name").value.trim() || "ESP-Pika Gateway",
+        pairing_mode: selectedEZPairingMode || "auto",
+      }),
+    });
+    applyEZDeviceStatus(res);
+  } catch (err) {
+    if (infoLine) infoLine.textContent = `发起配对失败: ${err.message}`;
+  }
+});
+
+document.getElementById("ezdevice-reset-btn")?.addEventListener("click", async () => {
+  const infoLine = document.getElementById("ezdevice-info-line");
+  try {
+    const res = await api("/api/v1/ezdevice/reset", { method: "POST" });
+    applyEZDeviceStatus(res);
+  } catch (err) {
+    if (infoLine) infoLine.textContent = `重置配对失败: ${err.message}`;
+  }
+});
+
+document.getElementById("ezdevice-test-btn")?.addEventListener("click", async () => {
+  const infoLine = document.getElementById("ezdevice-info-line");
+  if (infoLine) {
+    infoLine.style.color = "var(--muted)";
+    infoLine.textContent = "正在向 EZ Assistant 主控会话发送测试消息并合成语音...";
+  }
+  try {
+    const res = await api("/api/v1/ezdevice/test", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    if (infoLine) {
+      infoLine.style.color = "var(--ok)";
+      infoLine.textContent = `测试成功（TTS ${res.tts_frames_sent || 0} 帧）: ${res.reply_text || ""}`;
+    }
+  } catch (err) {
+    if (infoLine) {
+      infoLine.style.color = "var(--err)";
+      infoLine.textContent = `测试发送失败: ${err.message}`;
+    }
+  }
+});
+
 async function refreshAll() {
-  await Promise.allSettled([refreshHealth(), refreshDevices(), refreshMacs(), refreshAcls(), refreshSpeakers()]);
+  await Promise.allSettled([refreshHealth(), refreshPrompt(), refreshDeepSeekSettings(), refreshEZDeviceStatus(), refreshDevices(), refreshMacs(), refreshAcls(), refreshSpeakers()]);
 }
 
 document.getElementById("refresh-all-btn").addEventListener("click", refreshAll);

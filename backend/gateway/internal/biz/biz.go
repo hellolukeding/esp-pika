@@ -8,6 +8,7 @@ var ProviderSet = wire.NewSet(
 	NewACLUsecase,
 	NewDeviceUsecase,
 	NewSpeakerUsecase,
+	NewSettingsUsecase,
 	NewSessionRouter,
 	NewSpeechPipeline,
 )

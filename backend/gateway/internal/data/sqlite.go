@@ -441,3 +441,38 @@ func (r *deviceRepo) ListShadows(ctx context.Context, groupID string) ([]*biz.De
 	}
 	return items, rows.Err()
 }
+
+type sqliteSettingsRepo struct {
+	data *Data
+}
+
+// NewSQLiteSettingsRepo constructs a SQLite-backed SettingsRepo.
+func NewSQLiteSettingsRepo(data *Data) biz.SettingsRepo {
+	return &sqliteSettingsRepo{data: data}
+}
+
+func (r *sqliteSettingsRepo) Get(ctx context.Context, key string) (string, error) {
+	var val string
+	err := r.data.db.QueryRowContext(ctx, `SELECT value FROM gateway_settings WHERE key = ?`, key).Scan(&val)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get setting %q: %w", key, err)
+	}
+	return val, nil
+}
+
+func (r *sqliteSettingsRepo) Set(ctx context.Context, key, value string) error {
+	_, err := r.data.db.ExecContext(ctx, `
+		INSERT INTO gateway_settings (key, value, updated_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(key) DO UPDATE SET
+			value = excluded.value,
+			updated_at = excluded.updated_at
+	`, key, value, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("set setting %q: %w", key, err)
+	}
+	return nil
+}

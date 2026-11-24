@@ -23,6 +23,7 @@ type VoiceDebugHandler struct {
 	voiceServerURL string
 	speakers       *biz.SpeakerUsecase
 	speech         *biz.SpeechPipeline
+	settings       *biz.SettingsUsecase
 	client         *http.Client
 	log            *log.Helper
 }
@@ -32,6 +33,7 @@ func NewVoiceDebugHandler(
 	cVoice *conf.Voice,
 	speakers *biz.SpeakerUsecase,
 	speech *biz.SpeechPipeline,
+	settings *biz.SettingsUsecase,
 	logger log.Logger,
 ) *VoiceDebugHandler {
 	vsURL := ""
@@ -42,6 +44,7 @@ func NewVoiceDebugHandler(
 		voiceServerURL: vsURL,
 		speakers:       speakers,
 		speech:         speech,
+		settings:       settings,
 		client:         &http.Client{Timeout: 15 * time.Second},
 		log:            log.NewHelper(logger),
 	}
@@ -77,6 +80,7 @@ func (h *VoiceDebugHandler) HandleEnroll(w http.ResponseWriter, r *http.Request)
 	}
 
 	var vsResult map[string]any
+	var enrolledEmbedding []float32
 	if h.voiceServerURL != "" && req.AudioBase64 != "" {
 		fwdBody, _ := json.Marshal(map[string]any{
 			"speaker_id":   req.SpeakerID,
@@ -98,6 +102,12 @@ func (h *VoiceDebugHandler) HandleEnroll(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		_ = json.Unmarshal(rawResp, &vsResult)
+		var parsedResp struct {
+			Embedding []float32 `json:"embedding"`
+		}
+		if err := json.Unmarshal(rawResp, &parsedResp); err == nil {
+			enrolledEmbedding = parsedResp.Embedding
+		}
 	}
 
 	if h.speakers != nil {
@@ -108,6 +118,7 @@ func (h *VoiceDebugHandler) HandleEnroll(w http.ResponseWriter, r *http.Request)
 			GroupID:     req.GroupID,
 			DisplayName: req.DisplayName,
 			Role:        req.Role,
+			Embedding:   enrolledEmbedding,
 			Prompt:      req.Prompt,
 			TTSVoice:    req.TTSVoice,
 		})
@@ -226,4 +237,93 @@ func (h *VoiceDebugHandler) HandleTranscribe(w http.ResponseWriter, r *http.Requ
 		"ok":   true,
 		"text": text,
 	})
+}
+
+// HandleSystemPrompt handles `GET` and `PUT`/`POST /api/v1/settings/prompt` for dynamic Agent prompt tuning.
+func (h *VoiceDebugHandler) HandleSystemPrompt(w http.ResponseWriter, r *http.Request) {
+	if h.settings == nil {
+		http.Error(w, "settings unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		stored, effective, err := h.settings.GetSystemPrompt(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"system_prompt":    stored,
+			"effective_prompt": effective,
+			"default_prompt":   biz.DefaultSystemPrompt,
+		})
+	case http.MethodPut, http.MethodPost:
+		var req struct {
+			SystemPrompt string `json:"system_prompt"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 256*1024)).Decode(&req); err != nil {
+			http.Error(w, "invalid prompt payload", http.StatusBadRequest)
+			return
+		}
+		stored, effective, err := h.settings.SetSystemPrompt(r.Context(), req.SystemPrompt)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":               true,
+			"system_prompt":    stored,
+			"effective_prompt": effective,
+			"default_prompt":   biz.DefaultSystemPrompt,
+		})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// HandleDeepSeekSettings handles `GET` and `PUT`/`POST /api/v1/settings/deepseek` for Web Console DeepSeek key, model, and TTS voice configuration.
+func (h *VoiceDebugHandler) HandleDeepSeekSettings(w http.ResponseWriter, r *http.Request) {
+	if h.settings == nil {
+		http.Error(w, "settings unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		view, err := h.settings.GetDeepSeekSettings(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(view)
+	case http.MethodPut, http.MethodPost:
+		var req struct {
+			APIKey   string `json:"api_key"`
+			ClearKey bool   `json:"clear_key"`
+			Model    string `json:"model"`
+			TTSVoice string `json:"tts_voice"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&req); err != nil {
+			http.Error(w, "invalid deepseek settings payload", http.StatusBadRequest)
+			return
+		}
+		view, err := h.settings.SetDeepSeekSettings(r.Context(), req.APIKey, req.ClearKey, req.Model, req.TTSVoice)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":         true,
+			"configured": view.Configured,
+			"masked_key": view.MaskedKey,
+			"source":     view.Source,
+			"model":      view.Model,
+			"tts_voice":  view.TTSVoice,
+		})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }

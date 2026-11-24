@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -182,6 +183,16 @@ func (m *MCPServer) toolDefinitions() []map[string]any {
 				},
 			},
 		},
+		{
+			"name":        "device.fleet_list",
+			"description": "List online and registered ESP32 devices with zone, group, capabilities, and shadow status",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"group_id": map[string]any{"type": "string"},
+				},
+			},
+		},
 	}
 }
 
@@ -209,6 +220,26 @@ func (m *MCPServer) handleToolCall(ctx context.Context, w http.ResponseWriter, i
 		return
 	}
 
+	if p.Name == "device.fleet_list" {
+		groupID, _ := p.Arguments["group_id"].(string)
+		body, err := m.devices.FleetTopologyJSONForAgent(ctx, agentID, role, groupID)
+		if err != nil {
+			if errors.Is(err, biz.ErrACLDenied) {
+				writeRPCError(w, id, -32003, err.Error())
+				return
+			}
+			writeRPCResult(w, id, map[string]any{
+				"content": []map[string]any{{"type": "text", "text": err.Error()}},
+				"isError": true,
+			})
+			return
+		}
+		writeRPCResult(w, id, map[string]any{
+			"content": []map[string]any{{"type": "text", "text": body}},
+		})
+		return
+	}
+
 	target, _ := p.Arguments["target"].(string)
 	if strings.TrimSpace(target) == "" {
 		writeRPCError(w, id, -32602, "target is required")
@@ -223,7 +254,14 @@ func (m *MCPServer) handleToolCall(ctx context.Context, w http.ResponseWriter, i
 		TimeoutMS:  5000,
 	})
 	if err != nil {
-		writeRPCError(w, id, -32003, err.Error())
+		if errors.Is(err, biz.ErrACLDenied) {
+			writeRPCError(w, id, -32003, err.Error())
+			return
+		}
+		writeRPCResult(w, id, map[string]any{
+			"content": []map[string]any{{"type": "text", "text": err.Error()}},
+			"isError": true,
+		})
 		return
 	}
 
@@ -344,7 +382,7 @@ func parseRoleHeader(v string) biz.SpeakerRole {
 	case "guest":
 		return biz.SpeakerRoleGuest
 	default:
-		return biz.SpeakerRoleOwner
+		return biz.SpeakerRoleGuest
 	}
 }
 

@@ -223,6 +223,9 @@ type SendTurn struct {
 	Zone             string                 `protobuf:"bytes,10,opt,name=zone,proto3" json:"zone,omitempty"`
 	ShadowSnapshot   *v1.DeviceShadow       `protobuf:"bytes,11,opt,name=shadow_snapshot,json=shadowSnapshot,proto3" json:"shadow_snapshot,omitempty"`
 	FleetSummaryJson string                 `protobuf:"bytes,12,opt,name=fleet_summary_json,json=fleetSummaryJson,proto3" json:"fleet_summary_json,omitempty"`
+	SystemPrompt     string                 `protobuf:"bytes,13,opt,name=system_prompt,json=systemPrompt,proto3" json:"system_prompt,omitempty"`
+	ApiKey           string                 `protobuf:"bytes,14,opt,name=api_key,json=apiKey,proto3" json:"api_key,omitempty"`
+	Model            string                 `protobuf:"bytes,15,opt,name=model,proto3" json:"model,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -337,6 +340,27 @@ func (x *SendTurn) GetShadowSnapshot() *v1.DeviceShadow {
 func (x *SendTurn) GetFleetSummaryJson() string {
 	if x != nil {
 		return x.FleetSummaryJson
+	}
+	return ""
+}
+
+func (x *SendTurn) GetSystemPrompt() string {
+	if x != nil {
+		return x.SystemPrompt
+	}
+	return ""
+}
+
+func (x *SendTurn) GetApiKey() string {
+	if x != nil {
+		return x.ApiKey
+	}
+	return ""
+}
+
+func (x *SendTurn) GetModel() string {
+	if x != nil {
+		return x.Model
 	}
 	return ""
 }
@@ -917,7 +941,7 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"\n" +
 	"send_event\x18\x02 \x01(\v2\x1c.esp_pika.agent.v1.SendEventH\x00R\tsendEvent\x127\n" +
 	"\x06cancel\x18\x03 \x01(\v2\x1d.esp_pika.agent.v1.CancelTurnH\x00R\x06cancelB\t\n" +
-	"\apayload\"\xc6\x03\n" +
+	"\apayload\"\x9a\x04\n" +
 	"\bSendTurn\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x17\n" +
@@ -935,7 +959,10 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"\x04zone\x18\n" +
 	" \x01(\tR\x04zone\x12I\n" +
 	"\x0fshadow_snapshot\x18\v \x01(\v2 .esp_pika.device.v1.DeviceShadowR\x0eshadowSnapshot\x12,\n" +
-	"\x12fleet_summary_json\x18\f \x01(\tR\x10fleetSummaryJson\"\x9d\x02\n" +
+	"\x12fleet_summary_json\x18\f \x01(\tR\x10fleetSummaryJson\x12#\n" +
+	"\rsystem_prompt\x18\r \x01(\tR\fsystemPrompt\x12\x17\n" +
+	"\aapi_key\x18\x0e \x01(\tR\x06apiKey\x12\x14\n" +
+	"\x05model\x18\x0f \x01(\tR\x05model\"\x9d\x02\n" +
 	"\tSendEvent\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x19\n" +

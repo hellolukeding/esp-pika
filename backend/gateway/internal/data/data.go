@@ -23,9 +23,12 @@ var ProviderSet = wire.NewSet(
 	NewSQLiteAllowedMacRepo,
 	NewSQLiteACLRepo,
 	NewSQLiteSpeakerRepo,
+	NewSQLiteSettingsRepo,
 	NewDeviceRepo,
 	NewNATSEventBus,
 	NewGRPCAgentAdapter,
+	NewEZDeviceBridge,
+	NewAgentAdapter,
 	NewASRProvider,
 	NewTTSProvider,
 	NewVoiceReviewer,
@@ -156,6 +159,13 @@ func initSchema(db *sql.DB) error {
 			capability_pattern TEXT NOT NULL DEFAULT '',
 			min_speaker_role INTEGER NOT NULL DEFAULT 0,
 			allow INTEGER NOT NULL DEFAULT 1
+		);`,
+		`INSERT OR IGNORE INTO acl_rules (rule_id, agent_id, group_id, zone_pattern, device_id, capability_pattern, min_speaker_role, allow)
+		 VALUES ('default-ez-assistant-owner', 'ez-assistant', '*', '*', '*', 'device.*', 1, 1);`,
+		`CREATE TABLE IF NOT EXISTS gateway_settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL DEFAULT '',
+			updated_at DATETIME NOT NULL
 		);`,
 	}
 	for _, s := range stmts {

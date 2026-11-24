@@ -336,7 +336,7 @@ func (uc *DeviceUsecase) InvokeCommand(ctx context.Context, agentID string, role
 	return sink.InvokeCommand(ctx, cmd)
 }
 
-// GetShadow returns the cached shadow of a device.
+// GetShadow returns the cached shadow of a device reconciled against active live connections.
 func (uc *DeviceUsecase) GetShadow(ctx context.Context, rawMAC string) (*DeviceShadow, error) {
 	mac, err := NormalizeMAC(rawMAC)
 	if err != nil {
@@ -349,10 +349,14 @@ func (uc *DeviceUsecase) GetShadow(ctx context.Context, rawMAC string) (*DeviceS
 	if shadow == nil {
 		return nil, ErrDeviceNotFound
 	}
+	uc.mu.RLock()
+	_, live := uc.conns[mac]
+	uc.mu.RUnlock()
+	shadow.Online = live
 	return shadow, nil
 }
 
-// ListDevices returns all known devices and their shadow states.
+// ListDevices returns all known devices and their shadow states reconciled against live connections.
 func (uc *DeviceUsecase) ListDevices(ctx context.Context, groupID string, onlineOnly bool) ([]*DeviceSummary, error) {
 	hellos, err := uc.repo.ListHellos(ctx, groupID)
 	if err != nil {
@@ -367,9 +371,19 @@ func (uc *DeviceUsecase) ListDevices(ctx context.Context, groupID string, online
 		shadowMap[s.DeviceID] = s
 	}
 
+	uc.mu.RLock()
+	live := make(map[string]bool, len(uc.conns))
+	for mac := range uc.conns {
+		live[mac] = true
+	}
+	uc.mu.RUnlock()
+
 	res := make([]*DeviceSummary, 0, len(hellos))
 	for _, h := range hellos {
 		s := shadowMap[h.DeviceID]
+		if s != nil {
+			s.Online = live[h.DeviceID]
+		}
 		if onlineOnly && (s == nil || !s.Online) {
 			continue
 		}
@@ -392,4 +406,18 @@ func (uc *DeviceUsecase) FleetTopologyJSON(ctx context.Context, groupID string) 
 		return "", fmt.Errorf("marshal fleet topology: %w", err)
 	}
 	return string(b), nil
+}
+
+// FleetTopologyJSONForAgent enforces `device.fleet_list` ACL before returning the fleet snapshot.
+func (uc *DeviceUsecase) FleetTopologyJSONForAgent(ctx context.Context, agentID string, role SpeakerRole, groupID string) (string, error) {
+	if uc.acl != nil {
+		if err := uc.acl.CheckAccess(ctx, agentID, role, &DeviceHello{
+			DeviceID: "*",
+			GroupID:  groupID,
+			Zone:     "*",
+		}, "device.fleet_list"); err != nil {
+			return "", err
+		}
+	}
+	return uc.FleetTopologyJSON(ctx, groupID)
 }

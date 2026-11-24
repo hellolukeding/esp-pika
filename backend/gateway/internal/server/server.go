@@ -10,4 +10,5 @@ var ProviderSet = wire.NewSet(
 	NewVoiceDebugHandler,
 	NewMCPServer,
 	NewMDNSServer,
+	NewEZDeviceServer,
 )

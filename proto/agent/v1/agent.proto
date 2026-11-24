@@ -40,6 +40,9 @@ message SendTurn {
   string zone = 10;
   esp_pika.device.v1.DeviceShadow shadow_snapshot = 11;
   string fleet_summary_json = 12;
+  string system_prompt = 13;
+  string api_key = 14;
+  string model = 15;
 }
 
 message SendEvent {

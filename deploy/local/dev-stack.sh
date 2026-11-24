@@ -26,6 +26,16 @@ echo "==> Checking NATS & Qdrant containers"
 docker compose -f deploy/local/docker-compose.yml up -d
 
 mkdir -p "$TMP_DIR/media"
+ASR_PROVIDER="mock"
+TTS_PROVIDER="mock"
+DEFAULT_TTS_VOICE="zh_female_calm"
+SPEECH_API_KEY_ENV="OPENAI_API_KEY"
+if [ "$MODE" != "smoke" ] && [ -n "${DEEPSEEK_API_KEY:-}" ]; then
+  ASR_PROVIDER="deepseek"
+  TTS_PROVIDER="deepseek"
+  DEFAULT_TTS_VOICE="stella"
+  SPEECH_API_KEY_ENV="DEEPSEEK_API_KEY"
+fi
 cat > "$TMP_DIR/gateway.yaml" <<EOF
 server:
   http:
@@ -61,9 +71,10 @@ voice:
   agent_grpc_addr: 127.0.0.1:9100
   voice_server_url: http://127.0.0.1:8081
   speaker_threshold: 0.6
-  asr_provider: mock
-  tts_provider: mock
-  default_tts_voice: zh_female_calm
+  asr_provider: $ASR_PROVIDER
+  tts_provider: $TTS_PROVIDER
+  default_tts_voice: $DEFAULT_TTS_VOICE
+  speech_api_key_env: $SPEECH_API_KEY_ENV
 EOF
 
 echo "==> Starting voice-server on :8081 (Qdrant http://127.0.0.1:6333)"
@@ -95,7 +106,22 @@ if [ "$MODE" = "smoke" ]; then
 fi
 
 echo "==> Starting ez-bridge on :9100"
-if [ "$MODE" != "smoke" ] && [ -n "${DEEPSEEK_API_KEY:-}" ]; then
+AGENT_PROVIDER="${AGENT_PROVIDER:-auto}"
+EZ_RUNTIME_HOME="${EZ_RUNTIME_HOME:-$HOME/.ez-assistant}"
+RESOLVED_PROVIDER="$AGENT_PROVIDER"
+if [ "$MODE" = "smoke" ]; then
+  RESOLVED_PROVIDER="ez-assistant"
+elif [ "$AGENT_PROVIDER" = "auto" ]; then
+  if [ -f "$EZ_RUNTIME_HOME/run/runtime.json" ]; then
+    RESOLVED_PROVIDER="ez-assistant"
+  elif [ -n "${DEEPSEEK_API_KEY:-}" ]; then
+    RESOLVED_PROVIDER="deepseek"
+  else
+    RESOLVED_PROVIDER="ez-assistant"
+  fi
+fi
+
+if [ "$RESOLVED_PROVIDER" = "deepseek" ]; then
   DEEPSEEK_MODEL="${DEEPSEEK_MODEL:-deepseek-flash}"
   DEEPSEEK_BASE_URL="${DEEPSEEK_BASE_URL:-https://api.deepseek.com}"
   ./agent/ez-bridge/bin/ez-bridge \
@@ -106,9 +132,22 @@ if [ "$MODE" != "smoke" ] && [ -n "${DEEPSEEK_API_KEY:-}" ]; then
     --gateway-mcp-url http://127.0.0.1:8080/mcp >"$TMP_DIR/ez-bridge.log" 2>&1 &
   PIDS+=($!)
 else
-  EZ_URL="${EZ_URL:-http://127.0.0.1:7240}"
-  EZ_TOKEN="${EZ_TOKEN:-dev-token}"
-  ./agent/ez-bridge/bin/ez-bridge --listen 127.0.0.1:9100 --provider ez-assistant --ez-url "$EZ_URL" --ez-token "$EZ_TOKEN" --mcp-server-key esp-pika >"$TMP_DIR/ez-bridge.log" 2>&1 &
+  if [ -n "${EZ_TOKEN:-}" ] || [ "$MODE" = "smoke" ]; then
+    EZ_URL="${EZ_URL:-http://127.0.0.1:7240}"
+    EZ_TOKEN="${EZ_TOKEN:-dev-token}"
+    ./agent/ez-bridge/bin/ez-bridge \
+      --listen 127.0.0.1:9100 \
+      --provider ez-assistant \
+      --ez-url "$EZ_URL" \
+      --ez-token "$EZ_TOKEN" \
+      --mcp-server-key esp-pika >"$TMP_DIR/ez-bridge.log" 2>&1 &
+  else
+    ./agent/ez-bridge/bin/ez-bridge \
+      --listen 127.0.0.1:9100 \
+      --provider ez-assistant \
+      --runtime-home "$EZ_RUNTIME_HOME" \
+      --mcp-server-key esp-pika >"$TMP_DIR/ez-bridge.log" 2>&1 &
+  fi
   PIDS+=($!)
 fi
 

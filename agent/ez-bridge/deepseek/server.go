@@ -89,9 +89,7 @@ type Server struct {
 
 // NewServer constructs a direct DeepSeek AgentSessionService server.
 func NewServer(cfg Config) (*Server, error) {
-	if strings.TrimSpace(cfg.APIKey) == "" {
-		return nil, fmt.Errorf("deepseek api_key is required")
-	}
+	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
 	if strings.TrimSpace(cfg.BaseURL) == "" {
 		cfg.BaseURL = defaultBaseURL
 	}
@@ -159,7 +157,7 @@ func (s *Server) handleTurn(ctx context.Context, stream agentv1.AgentSessionServ
 	if agentID == "" {
 		agentID = s.cfg.AgentID
 	}
-	return s.executePrompt(ctx, stream, turn.GetSessionId(), turn.GetTurnId(), agentID, turn.GetSpeakerRole(), formatTurnPrompt(turn))
+	return s.executePrompt(ctx, stream, turn.GetSessionId(), turn.GetTurnId(), agentID, turn.GetSpeakerRole(), turn.GetSystemPrompt(), turn.GetApiKey(), turn.GetModel(), formatTurnPrompt(turn))
 }
 
 func (s *Server) handleDeviceEvent(ctx context.Context, stream agentv1.AgentSessionService_ConverseServer, devEvt *agentv1.SendEvent) error {
@@ -172,7 +170,7 @@ func (s *Server) handleDeviceEvent(ctx context.Context, stream agentv1.AgentSess
 	}
 	prompt := fmt.Sprintf("[Proactive Device Event]\nevent_type: %s\nsource_device_id: %s\nzone: %s\ngroup_id: %s\npayload_json: %s\nDecide whether to inspect via MCP tools or alert the user briefly in spoken language.",
 		devEvt.GetEventType(), devEvt.GetSourceDeviceId(), devEvt.GetZone(), devEvt.GetGroupId(), devEvt.GetPayloadJson())
-	return s.executePrompt(ctx, stream, devEvt.GetSessionId(), "", agentID, devicev1.SpeakerRole_SPEAKER_ROLE_OWNER, prompt)
+	return s.executePrompt(ctx, stream, devEvt.GetSessionId(), "", agentID, devicev1.SpeakerRole_SPEAKER_ROLE_OWNER, "", "", "", prompt)
 }
 
 func (s *Server) handleCancel(cancel *agentv1.CancelTurn) {
@@ -195,6 +193,9 @@ func (s *Server) executePrompt(
 	turnID string,
 	agentID string,
 	speakerRole devicev1.SpeakerRole,
+	systemPrompt string,
+	apiKey string,
+	model string,
 	userPrompt string,
 ) error {
 	runCtx, cancel := context.WithCancel(ctx)
@@ -212,11 +213,11 @@ func (s *Server) executePrompt(
 	_ = sendStatus(stream, sessionID, turnID, "thinking", "正在思考")
 
 	tools, nameMap := s.fetchMCPTools(runCtx, agentID)
-	history := s.snapshotSession(sessionID)
+	history := s.snapshotSession(sessionID, systemPrompt)
 	history = append(history, chatMessage{Role: "user", Content: userPrompt})
 
 	for round := 0; round < defaultMaxToolRounds; round++ {
-		assistantMsg, err := s.streamCompletionRound(runCtx, stream, sessionID, turnID, history, tools)
+		assistantMsg, err := s.streamCompletionRound(runCtx, stream, sessionID, turnID, apiKey, model, history, tools)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return stream.Send(makeDoneEvent(sessionID, turnID, "cancelled", err.Error()))
@@ -249,12 +250,16 @@ func (s *Server) executePrompt(
 	return stream.Send(makeDoneEvent(sessionID, turnID, "completed", ""))
 }
 
-func (s *Server) snapshotSession(sessionID string) []chatMessage {
+func (s *Server) snapshotSession(sessionID, systemPrompt string) []chatMessage {
+	sys := strings.TrimSpace(systemPrompt)
+	if sys == "" {
+		sys = s.cfg.SystemPrompt
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	existing := s.sessions[sessionID]
 	out := make([]chatMessage, 0, len(existing)+1)
-	out = append(out, chatMessage{Role: "system", Content: s.cfg.SystemPrompt})
+	out = append(out, chatMessage{Role: "system", Content: sys})
 	out = append(out, existing...)
 	return out
 }
@@ -288,11 +293,24 @@ func (s *Server) streamCompletionRound(
 	stream agentv1.AgentSessionService_ConverseServer,
 	sessionID string,
 	turnID string,
+	apiKey string,
+	model string,
 	messages []chatMessage,
 	tools []chatToolDef,
 ) (chatMessage, error) {
+	effectiveKey := strings.TrimSpace(apiKey)
+	if effectiveKey == "" {
+		effectiveKey = s.cfg.APIKey
+	}
+	if effectiveKey == "" {
+		return chatMessage{}, fmt.Errorf("deepseek api_key is not configured (set it in Web Console or DEEPSEEK_API_KEY)")
+	}
+	effectiveModel := strings.TrimSpace(model)
+	if effectiveModel == "" {
+		effectiveModel = s.cfg.Model
+	}
 	reqBody := chatCompletionRequest{
-		Model:    s.cfg.Model,
+		Model:    effectiveModel,
 		Messages: messages,
 		Tools:    tools,
 		Stream:   true,
@@ -308,7 +326,7 @@ func (s *Server) streamCompletionRound(
 		return chatMessage{}, fmt.Errorf("build deepseek request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+s.cfg.APIKey)
+	req.Header.Set("Authorization", "Bearer "+effectiveKey)
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {

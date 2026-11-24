@@ -398,6 +398,26 @@ func TestSpeechFilterChunkerAndArbitrator(t *testing.T) {
 		t.Fatalf("expected remainder flush, got %q", rem)
 	}
 
+	// Verify decimals, short prefixes, and long comma clauses behave smoothly.
+	if decSents := chunker.Push("今天气温12."); len(decSents) != 0 {
+		t.Fatalf("expected pending decimal not to split early, got %v", decSents)
+	}
+	if decSents := chunker.Push("5度，体感舒适。"); len(decSents) != 1 || decSents[0] != "今天气温12.5度，体感舒适。" {
+		t.Fatalf("expected decimal kept together, got %v", decSents)
+	}
+	if prefixSents := chunker.Push("好的。今天宁波晴转多云。"); len(prefixSents) != 1 || prefixSents[0] != "好的。今天宁波晴转多云。" {
+		t.Fatalf("expected short prefix merged with next sentence, got %v", prefixSents)
+	}
+	longClause := "今天宁波天气非常不错，空气质量良好适合户外散步，下午温度大约在二十二度左右，" +
+		"晚上可能会有微风吹过但整体依然舒适，建议出门的时候带一件轻薄外套以备降温"
+	longSents := chunker.Push(longClause)
+	if len(longSents) != 1 || !strings.HasSuffix(longSents[0], "，") {
+		t.Fatalf("expected long unpunctuated clause split on comma boundary, got %v", longSents)
+	}
+	if !strings.Contains(longSents[0]+chunker.Flush(), "建议出门") {
+		t.Fatalf("expected UTF-8 intact remainder after comma split")
+	}
+
 	arb := NewSpeakerArbitrator()
 	dev := "30:ed:a0:f3:dc:70"
 	if !arb.Acquire(dev, "turn_conv", AudioPriorityConversation) {
@@ -412,5 +432,44 @@ func TestSpeechFilterChunkerAndArbitrator(t *testing.T) {
 	arb.Release(dev, "turn_alert")
 	if !arb.Acquire(dev, "turn_bg", AudioPriorityNotification) {
 		t.Fatalf("expected notification allowed after alert released")
+	}
+}
+
+func TestDeviceUsecaseReconcilesStaleOnlineShadow(t *testing.T) {
+	ctx := context.Background()
+	repo := newMemDeviceRepo()
+	acl := NewACLUsecase(&memACLRepo{}, log.DefaultLogger)
+	uc := NewDeviceUsecase(repo, acl, nil, log.DefaultLogger)
+
+	mac := "30:ed:a0:f4:5b:f0"
+	_ = repo.SaveHello(ctx, &DeviceHello{
+		DeviceID: mac,
+		MAC:      mac,
+		GroupID:  "home-default",
+		Zone:     "study",
+	})
+	_ = repo.SaveShadow(ctx, &DeviceShadow{
+		DeviceID: mac,
+		GroupID:  "home-default",
+		Zone:     "study",
+		Online:   true, // stale persisted state after ungraceful shutdown
+	})
+
+	sh, err := uc.GetShadow(ctx, mac)
+	if err != nil {
+		t.Fatalf("GetShadow: %v", err)
+	}
+	if sh.Online {
+		t.Fatalf("expected GetShadow to reconcile Online=false when disconnected")
+	}
+
+	all, err := uc.ListDevices(ctx, "", false)
+	if err != nil || len(all) != 1 || all[0].Shadow.Online {
+		t.Fatalf("expected ListDevices(onlineOnly=false) to reconcile Online=false, got %+v err=%v", all, err)
+	}
+
+	online, err := uc.ListDevices(ctx, "", true)
+	if err != nil || len(online) != 0 {
+		t.Fatalf("expected ListDevices(onlineOnly=true) to exclude disconnected ghost, got %+v err=%v", online, err)
 	}
 }

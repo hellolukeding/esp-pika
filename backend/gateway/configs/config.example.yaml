@@ -36,11 +36,15 @@ voice:
   agent_grpc_addr: 127.0.0.1:9100
   voice_server_url: http://127.0.0.1:8081
   speaker_threshold: 0.6
+  # Supported asr_provider: deepseek | openai | http | mock
   asr_provider: mock
   asr_endpoint: ""
   asr_model: whisper-1
+  # Supported tts_provider: deepseek | openai | http | mock
   tts_provider: mock
   tts_endpoint: ""
   tts_model: tts-1
+  # DeepSeek voices: stella (female), tide (male)
   default_tts_voice: zh_female_calm
+  # Env var name holding ASR/TTS Bearer token (e.g. DEEPSEEK_API_KEY or OPENAI_API_KEY)
   speech_api_key_env: OPENAI_API_KEY

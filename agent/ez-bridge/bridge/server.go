@@ -273,6 +273,11 @@ func makeDoneEvent(sessionID, turnID, reason, errMsg string) *agentv1.AgentToGat
 
 func formatTurnPrompt(turn *agentv1.SendTurn) string {
 	var b strings.Builder
+	if sp := strings.TrimSpace(turn.GetSystemPrompt()); sp != "" {
+		b.WriteString("[System Instructions]\n")
+		b.WriteString(sp)
+		b.WriteString("\n")
+	}
 	b.WriteString("[ESP-Pika Device Context]\n")
 	if turn.GetSpeakerId() != "" {
 		fmt.Fprintf(&b, "speaker_id: %s\n", turn.GetSpeakerId())

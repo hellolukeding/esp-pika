@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -16,30 +17,92 @@ import (
 	"esp-pika/backend/gateway/internal/biz"
 	"esp-pika/backend/gateway/internal/conf"
 
+	"github.com/coder/websocket"
 	"github.com/go-kratos/kratos/v2/log"
 )
 
 const (
-	defaultOpenAIASRURL = "https://api.openai.com/v1/audio/transcriptions"
-	defaultOpenAITTSURL = "https://api.openai.com/v1/audio/speech"
+	defaultOpenAIASRURL     = "https://api.openai.com/v1/audio/transcriptions"
+	defaultOpenAITTSURL     = "https://api.openai.com/v1/audio/speech"
+	defaultDeepSeekASRURL   = "https://api.deepseek.com/v1/tools/asr"
+	defaultDeepSeekTTSWSURL = "wss://api.deepseek.com/v1/tools/tts"
 )
 
 func resolveSpeechAPIKey(c *conf.Voice) string {
-	if c == nil {
-		return ""
-	}
-	envName := strings.TrimSpace(c.SpeechApiKeyEnv)
-	if envName == "" {
-		return ""
-	}
-	return strings.TrimSpace(os.Getenv(envName))
+	return resolveSpeechAPIKeyWithFallback(c, "")
 }
 
-// NewASRProvider selects OpenAI-compatible or custom HTTP ASR when configured, otherwise falls back to mock bench ASR.
-func NewASRProvider(c *conf.Voice, logger log.Logger) biz.ASRProvider {
+func resolveSpeechAPIKeyWithFallback(c *conf.Voice, fallbackEnv string) string {
+	if c != nil {
+		envName := strings.TrimSpace(c.SpeechApiKeyEnv)
+		if envName != "" {
+			return strings.TrimSpace(os.Getenv(envName))
+		}
+	}
+	if fallbackEnv != "" {
+		return strings.TrimSpace(os.Getenv(fallbackEnv))
+	}
+	return ""
+}
+
+func normalizeDeepSeekVoice(voice, defaultVoice string) string {
+	return biz.NormalizeDeepSeekVoice(voice, defaultVoice)
+}
+
+func resolveDynamicDeepSeekKey(ctx context.Context, repo biz.SettingsRepo, staticFallback string) string {
+	if repo != nil {
+		if stored, err := repo.Get(ctx, biz.SettingKeyDeepSeekAPIKey); err == nil {
+			if trimmed := strings.TrimSpace(stored); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	if strings.TrimSpace(staticFallback) != "" {
+		return strings.TrimSpace(staticFallback)
+	}
+	return strings.TrimSpace(os.Getenv("DEEPSEEK_API_KEY"))
+}
+
+// NewASRProvider selects EZ Assistant Desktop speech relay first when ready, falling back to local configured/mock ASR.
+func NewASRProvider(c *conf.Voice, settingsRepo biz.SettingsRepo, ezBridge biz.EZDeviceBridge, logger log.Logger) biz.ASRProvider {
 	helper := log.NewHelper(logger)
+	local := buildLocalASRProvider(c, settingsRepo, helper)
+	if ezBridge == nil {
+		return local
+	}
+	return &routingASRProvider{
+		local:    local,
+		ezBridge: ezBridge,
+		log:      helper,
+	}
+}
+
+func buildLocalASRProvider(c *conf.Voice, settingsRepo biz.SettingsRepo, helper *log.Helper) biz.ASRProvider {
+	asrHTTPClient := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			ForceAttemptHTTP2:   true,
+			MaxIdleConns:        16,
+			MaxIdleConnsPerHost: 4,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
 	if c != nil {
 		switch strings.ToLower(strings.TrimSpace(c.AsrProvider)) {
+		case "deepseek":
+			endpoint := strings.TrimSpace(c.AsrEndpoint)
+			if endpoint == "" {
+				endpoint = defaultDeepSeekASRURL
+			}
+			helper.Infof("initialized DeepSeek ASRProvider endpoint=%s", endpoint)
+			return &openaiASRProvider{
+				endpoint:     endpoint,
+				model:        "",
+				apiKey:       resolveSpeechAPIKeyWithFallback(c, "DEEPSEEK_API_KEY"),
+				settingsRepo: settingsRepo,
+				isDeepSeek:   true,
+				client:       asrHTTPClient,
+			}
 		case "openai":
 			endpoint := c.AsrEndpoint
 			if endpoint == "" {
@@ -54,7 +117,7 @@ func NewASRProvider(c *conf.Voice, logger log.Logger) biz.ASRProvider {
 				endpoint: endpoint,
 				model:    model,
 				apiKey:   resolveSpeechAPIKey(c),
-				client:   &http.Client{Timeout: 30 * time.Second},
+				client:   asrHTTPClient,
 			}
 		case "http":
 			if c.AsrEndpoint != "" {
@@ -70,11 +133,36 @@ func NewASRProvider(c *conf.Voice, logger log.Logger) biz.ASRProvider {
 	return &mockASRProvider{}
 }
 
-// NewTTSProvider selects OpenAI-compatible or custom HTTP TTS when configured, otherwise falls back to mock Opus frame synthesis.
-func NewTTSProvider(c *conf.Voice, logger log.Logger) biz.TTSProvider {
+// NewTTSProvider selects EZ Assistant Desktop speech relay first when ready, falling back to local configured/mock TTS.
+func NewTTSProvider(c *conf.Voice, settingsRepo biz.SettingsRepo, ezBridge biz.EZDeviceBridge, logger log.Logger) biz.TTSProvider {
 	helper := log.NewHelper(logger)
+	local := buildLocalTTSProvider(c, settingsRepo, helper)
+	if ezBridge == nil {
+		return local
+	}
+	return &routingTTSProvider{
+		local:    local,
+		ezBridge: ezBridge,
+		log:      helper,
+	}
+}
+
+func buildLocalTTSProvider(c *conf.Voice, settingsRepo biz.SettingsRepo, helper *log.Helper) biz.TTSProvider {
 	if c != nil {
 		switch strings.ToLower(strings.TrimSpace(c.TtsProvider)) {
+		case "deepseek":
+			endpoint := strings.TrimSpace(c.TtsEndpoint)
+			if endpoint == "" {
+				endpoint = defaultDeepSeekTTSWSURL
+			}
+			defaultVoice := normalizeDeepSeekVoice(c.DefaultTtsVoice, "stella")
+			helper.Infof("initialized DeepSeek WS TTSProvider endpoint=%s voice=%s", endpoint, defaultVoice)
+			return &deepseekTTSProvider{
+				endpoint:     endpoint,
+				defaultVoice: defaultVoice,
+				apiKey:       resolveSpeechAPIKeyWithFallback(c, "DEEPSEEK_API_KEY"),
+				settingsRepo: settingsRepo,
+			}
 		case "openai":
 			endpoint := c.TtsEndpoint
 			if endpoint == "" {
@@ -109,6 +197,141 @@ func NewTTSProvider(c *conf.Voice, logger log.Logger) biz.TTSProvider {
 	}
 	helper.Info("using local mock TTSProvider")
 	return &mockTTSProvider{}
+}
+
+type routingASRProvider struct {
+	local    biz.ASRProvider
+	ezBridge biz.EZDeviceBridge
+	log      *log.Helper
+}
+
+func (p *routingASRProvider) StartStream(_ context.Context, deviceID string) (biz.ASRStream, error) {
+	return &routingASRStream{
+		deviceID: deviceID,
+		local:    p.local,
+		ezBridge: p.ezBridge,
+		log:      p.log,
+	}, nil
+}
+
+type routingASRStream struct {
+	deviceID string
+	local    biz.ASRProvider
+	ezBridge biz.EZDeviceBridge
+	log      *log.Helper
+
+	mu     sync.Mutex
+	frames [][]byte
+}
+
+func (s *routingASRStream) WriteOpusFrame(_ context.Context, frame []byte) error {
+	cp := make([]byte, len(frame))
+	copy(cp, frame)
+	s.mu.Lock()
+	s.frames = append(s.frames, cp)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *routingASRStream) Finish(ctx context.Context) (string, error) {
+	s.mu.Lock()
+	frames := s.frames
+	s.frames = nil
+	s.mu.Unlock()
+	if len(frames) == 0 {
+		return "", nil
+	}
+
+	if s.ezBridge != nil && s.ezBridge.CanUseASR() {
+		var (
+			pcm []byte
+			err error
+		)
+		if len(frames) == 1 && bytes.HasPrefix(frames[0], []byte("RIFF")) {
+			pcm, err = WAVToPCM16kMono(frames[0])
+		} else {
+			ogg := BuildOggOpus(frames, 16000, 60)
+			pcm, err = OggOpusToPCM16kMono(ctx, ogg)
+		}
+		if err == nil && len(pcm) > 0 {
+			text, rErr := s.ezBridge.RecognizeSpeech(ctx, pcm)
+			if rErr == nil {
+				return text, nil
+			}
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			s.log.Warnf("EZ Assistant speech relay ASR failed, falling back to local provider: %v", rErr)
+		} else if err != nil {
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			s.log.Warnf("failed to prepare PCM16k for EZ speech relay ASR, falling back to local provider: %v", err)
+		}
+	}
+
+	localStream, err := s.local.StartStream(ctx, s.deviceID)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = localStream.Close() }()
+	for _, fr := range frames {
+		if err := localStream.WriteOpusFrame(ctx, fr); err != nil {
+			return "", err
+		}
+	}
+	return localStream.Finish(ctx)
+}
+
+func (s *routingASRStream) Close() error {
+	s.mu.Lock()
+	s.frames = nil
+	s.mu.Unlock()
+	return nil
+}
+
+type routingTTSProvider struct {
+	local    biz.TTSProvider
+	ezBridge biz.EZDeviceBridge
+	log      *log.Helper
+}
+
+func (p *routingTTSProvider) Synthesize(ctx context.Context, text, voice string) ([][]byte, error) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed != "" && p.ezBridge != nil && p.ezBridge.CanUseTTS() {
+		segments := SplitTextForRelayTTS(trimmed, relayMaxTTSSegmentRunes)
+		if len(segments) > 0 {
+			var combinedPCM bytes.Buffer
+			relayOK := true
+			for _, seg := range segments {
+				pcm, err := p.ezBridge.SynthesizeSpeech(ctx, seg)
+				if err != nil {
+					if ctx.Err() != nil {
+						return nil, ctx.Err()
+					}
+					p.log.Warnf("EZ Assistant speech relay TTS failed, falling back to local provider: %v", err)
+					relayOK = false
+					break
+				}
+				_, _ = combinedPCM.Write(pcm)
+			}
+			if relayOK && combinedPCM.Len() > 0 {
+				ogg, err := PCM16kMonoToOggOpus(ctx, combinedPCM.Bytes())
+				if err == nil {
+					packets := SplitOpusPackets(ExtractOggOpusPackets(ogg))
+					if len(packets) > 0 {
+						return packets, nil
+					}
+				} else {
+					if ctx.Err() != nil {
+						return nil, ctx.Err()
+					}
+					p.log.Warnf("failed to encode EZ relay TTS PCM16k to OggOpus, falling back to local provider: %v", err)
+				}
+			}
+		}
+	}
+	return p.local.Synthesize(ctx, text, voice)
 }
 
 // NewVoiceReviewer builds the gray-zone cloud voiceprint verifier talking to voice-server when enabled.
@@ -160,10 +383,19 @@ func (s *mockASRStream) Finish(_ context.Context) (string, error) {
 func (s *mockASRStream) Close() error { return nil }
 
 type openaiASRProvider struct {
-	endpoint string
-	model    string
-	apiKey   string
-	client   *http.Client
+	endpoint     string
+	model        string
+	apiKey       string
+	settingsRepo biz.SettingsRepo
+	isDeepSeek   bool
+	client       *http.Client
+}
+
+func (p *openaiASRProvider) resolveAPIKey(ctx context.Context) string {
+	if p.isDeepSeek {
+		return resolveDynamicDeepSeekKey(ctx, p.settingsRepo, p.apiKey)
+	}
+	return p.apiKey
 }
 
 func (p *openaiASRProvider) StartStream(_ context.Context, _ string) (biz.ASRStream, error) {
@@ -199,11 +431,15 @@ func (s *openaiASRStream) Finish(ctx context.Context) (string, error) {
 	if len(frames) == 1 && bytes.HasPrefix(frames[0], []byte("RIFF")) {
 		fileName = "utterance.wav"
 		audioBytes = frames[0]
+	} else if s.provider.isDeepSeek {
+		_ = os.WriteFile("/tmp/esp_pika_last_asr.ogg", audioBytes, 0o600)
 	}
 
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
-	_ = mw.WriteField("model", s.provider.model)
+	if s.provider.model != "" {
+		_ = mw.WriteField("model", s.provider.model)
+	}
 	fw, err := mw.CreateFormFile("file", fileName)
 	if err != nil {
 		return "", err
@@ -220,8 +456,8 @@ func (s *openaiASRStream) Finish(ctx context.Context) (string, error) {
 		return "", err
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
-	if s.provider.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+s.provider.apiKey)
+	if apiKey := s.provider.resolveAPIKey(ctx); apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 
 	resp, err := s.provider.client.Do(req)
@@ -360,7 +596,7 @@ func (p *openaiTTSProvider) Synthesize(ctx context.Context, text, voice string) 
 	if err != nil {
 		return nil, err
 	}
-	return ExtractOggOpusPackets(raw), nil
+	return SplitOpusPackets(ExtractOggOpusPackets(raw)), nil
 }
 
 type httpTTSProvider struct {
@@ -403,6 +639,124 @@ func (p *httpTTSProvider) Synthesize(ctx context.Context, text, voice string) ([
 		return nil, nil
 	}
 	return [][]byte{raw}, nil
+}
+
+type deepseekTTSProvider struct {
+	endpoint     string
+	defaultVoice string
+	apiKey       string
+	settingsRepo biz.SettingsRepo
+}
+
+func (p *deepseekTTSProvider) Synthesize(ctx context.Context, text, voice string) ([][]byte, error) {
+	if strings.TrimSpace(text) == "" {
+		return nil, nil
+	}
+	u, err := url.Parse(p.endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("invalid deepseek tts endpoint %q: %w", p.endpoint, err)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		u.Scheme = "wss"
+	case "http":
+		u.Scheme = "ws"
+	}
+	effectiveVoice := strings.TrimSpace(voice)
+	if effectiveVoice == "" && p.settingsRepo != nil {
+		if savedVoice, err := p.settingsRepo.Get(ctx, biz.SettingKeyDeepSeekVoice); err == nil {
+			effectiveVoice = strings.TrimSpace(savedVoice)
+		}
+	}
+	q := u.Query()
+	q.Set("voice_id", normalizeDeepSeekVoice(effectiveVoice, p.defaultVoice))
+	q.Set("format", "opus")
+	q.Set("filter_markdown", "true")
+	u.RawQuery = q.Encode()
+
+	var opts *websocket.DialOptions
+	if apiKey := resolveDynamicDeepSeekKey(ctx, p.settingsRepo, p.apiKey); apiKey != "" {
+		opts = &websocket.DialOptions{
+			HTTPHeader: http.Header{
+				"Authorization": []string{"Bearer " + apiKey},
+			},
+		}
+	}
+	wsURL := u.String()
+	frames, err := p.synthesizeOnce(ctx, wsURL, opts, text)
+	if err != nil && ctx.Err() == nil {
+		timer := time.NewTimer(250 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+		frames, err = p.synthesizeOnce(ctx, wsURL, opts, text)
+	}
+	return frames, err
+}
+
+func (p *deepseekTTSProvider) synthesizeOnce(ctx context.Context, wsURL string, opts *websocket.DialOptions, text string) ([][]byte, error) {
+	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(dialCtx, wsURL, opts)
+	if err != nil {
+		return nil, fmt.Errorf("dial deepseek tts ws: %w", err)
+	}
+	defer func() { _ = conn.CloseNow() }()
+	conn.SetReadLimit(4 << 20)
+
+	textReq, _ := json.Marshal(map[string]string{
+		"event": "text",
+		"text":  text,
+	})
+	if err := conn.Write(dialCtx, websocket.MessageText, textReq); err != nil {
+		return nil, fmt.Errorf("send deepseek tts text: %w", err)
+	}
+	if err := conn.Write(dialCtx, websocket.MessageText, []byte(`{"event":"finish_text"}`)); err != nil {
+		return nil, fmt.Errorf("send deepseek tts finish_text: %w", err)
+	}
+
+	var frames [][]byte
+	for {
+		mt, msg, err := conn.Read(dialCtx)
+		if err != nil {
+			if len(frames) > 0 && ctx.Err() == nil {
+				break
+			}
+			return nil, fmt.Errorf("read deepseek tts ws: %w", err)
+		}
+		switch mt {
+		case websocket.MessageBinary:
+			if len(msg) > 0 {
+				if bytes.HasPrefix(msg, []byte("OggS")) {
+					frames = append(frames, ExtractOggOpusPackets(msg)...)
+				} else {
+					cp := make([]byte, len(msg))
+					copy(cp, msg)
+					frames = append(frames, cp)
+				}
+			}
+		case websocket.MessageText:
+			var evt struct {
+				Event   string `json:"event"`
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			}
+			if err := json.Unmarshal(msg, &evt); err != nil {
+				continue
+			}
+			if evt.Event == "finish" {
+				if evt.Code != "" && evt.Code != "success" {
+					return nil, fmt.Errorf("deepseek tts finish error (%s): %s", evt.Code, evt.Message)
+				}
+				return SplitOpusPackets(frames), nil
+			}
+		}
+	}
+	return SplitOpusPackets(frames), nil
 }
 
 type httpVoiceReviewer struct {

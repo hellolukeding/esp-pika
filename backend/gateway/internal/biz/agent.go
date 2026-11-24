@@ -19,6 +19,9 @@ type AgentTurnRequest struct {
 	Zone             string
 	Shadow           *DeviceShadow
 	FleetSummaryJSON string
+	SystemPrompt     string
+	APIKey           string
+	Model            string
 }
 
 // AgentDeviceEvent carries a proactive device/sensor push event into the Agent brain layer.
