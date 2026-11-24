@@ -12,6 +12,7 @@ const char* DeviceStateName(DeviceState state) {
     case DeviceState::kListening: return "Listening";
     case DeviceState::kSpeaking: return "Speaking";
     case DeviceState::kOffline: return "Offline";
+    case DeviceState::kProvisioning: return "Provisioning";
     }
     return "Unknown";
 }
@@ -28,6 +29,18 @@ DeviceState AppStateMachine::OnWifiConnected() {
 
 DeviceState AppStateMachine::OnWifiLost() {
     state_ = DeviceState::kOffline;
+    return state_;
+}
+
+DeviceState AppStateMachine::OnPortalStarted() {
+    state_ = DeviceState::kProvisioning;
+    return state_;
+}
+
+DeviceState AppStateMachine::OnPortalStopped(bool wifi_connected) {
+    if (state_ == DeviceState::kProvisioning) {
+        state_ = wifi_connected ? DeviceState::kDiscovering : DeviceState::kOffline;
+    }
     return state_;
 }
 
@@ -59,7 +72,9 @@ DeviceState AppStateMachine::OnWsDisconnected() {
 }
 
 DeviceState AppStateMachine::OnLocalWakeTriggered() {
-    if (state_ == DeviceState::kConnectedIdle || state_ == DeviceState::kSpeaking) {
+    if (state_ == DeviceState::kConnectedIdle ||
+        state_ == DeviceState::kSpeaking ||
+        state_ == DeviceState::kListening) {
         state_ = DeviceState::kWakePending;
     }
     return state_;
@@ -74,6 +89,13 @@ DeviceState AppStateMachine::OnWakeAccept() {
 
 DeviceState AppStateMachine::OnWakeSuppress() {
     if (state_ == DeviceState::kWakePending || state_ == DeviceState::kListening) {
+        state_ = DeviceState::kConnectedIdle;
+    }
+    return state_;
+}
+
+DeviceState AppStateMachine::OnSpeechStopped() {
+    if (state_ == DeviceState::kListening) {
         state_ = DeviceState::kConnectedIdle;
     }
     return state_;

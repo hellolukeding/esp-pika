@@ -166,87 +166,97 @@ AvatarPose AvatarAnimator::PresetForEmotion(AvatarEmotion emotion) {
     AvatarPose p;
     switch (emotion) {
     case AvatarEmotion::kIdle:
+        // Exact pixel-measured 3/4 hero angle matching user's 1:1 concept.
+        p.yaw_deg = -26.0f;
+        p.pitch_deg = -2.0f;
+        p.roll_deg = 0.0f;
         break;
     case AvatarEmotion::kThinking:
-        p.yaw_deg = -9.0f;
-        p.pitch_deg = 8.5f;
-        p.roll_deg = -6.0f;
-        p.upper_lid = 0.16f;
-        p.lower_lid = 0.12f;
+        p.yaw_deg = -28.0f;
+        p.pitch_deg = 7.0f;
+        p.roll_deg = -5.0f;
+        p.upper_lid = 0.14f;
+        p.lower_lid = 0.10f;
         p.swirl_amount = 1.0f;
         p.focus_shift_x = -0.22f;
-        p.focus_shift_y = -0.24f;
+        p.focus_shift_y = -0.22f;
         break;
     case AvatarEmotion::kBlink:
+        p.yaw_deg = -26.0f;
         p.upper_lid = 0.62f;
         p.lower_lid = 0.44f;
         break;
     case AvatarEmotion::kLookLeft:
-        p.yaw_deg = -26.0f;
+        p.yaw_deg = -38.0f;
         p.pitch_deg = 2.0f;
         p.roll_deg = -3.0f;
-        p.focus_shift_x = -0.34f;
+        p.focus_shift_x = -0.30f;
         break;
     case AvatarEmotion::kLookRight:
-        p.yaw_deg = 26.0f;
+        p.yaw_deg = 22.0f;
         p.pitch_deg = 2.0f;
         p.roll_deg = 3.0f;
-        p.focus_shift_x = 0.34f;
+        p.focus_shift_x = 0.30f;
         break;
     case AvatarEmotion::kListening:
-        p.scale = 1.045f;
-        p.pitch_deg = -4.0f;
-        p.eye_aspect_y = 1.08f;
+        p.yaw_deg = -20.0f;
+        p.scale = 1.03f;
+        p.pitch_deg = -3.0f;
+        p.eye_aspect_y = 1.06f;
         p.eye_brightness = 1.18f;
         p.shadow_tint = 0.55f;
         break;
     case AvatarEmotion::kSpeaking:
-        p.scale = 1.02f;
+        p.yaw_deg = -22.0f;
+        p.scale = 1.015f;
         p.pitch_deg = 1.5f;
         p.swirl_amount = 0.35f;
         p.eye_brightness = 1.15f;
         p.shadow_tint = 0.50f;
         break;
     case AvatarEmotion::kTurn:
-        p.yaw_deg = -37.0f;
-        p.pitch_deg = -5.0f;
+        p.yaw_deg = -44.0f;
+        p.pitch_deg = -4.0f;
         p.roll_deg = -4.0f;
         break;
     case AvatarEmotion::kCurious:
         // Strictly pupil-less: asymmetry + tilted head + bright prism refraction focal shift.
-        p.yaw_deg = 7.0f;
-        p.pitch_deg = 4.0f;
-        p.roll_deg = 13.5f;
-        p.left_eye_scale = 1.18f;
+        p.yaw_deg = 6.0f;
+        p.pitch_deg = 3.0f;
+        p.roll_deg = 12.0f;
+        p.left_eye_scale = 1.10f;
         p.right_eye_scale = 0.84f;
-        p.eye_aspect_y = 1.06f;
-        p.focus_shift_x = 0.42f;
+        p.eye_aspect_y = 1.05f;
+        p.focus_shift_x = 0.36f;
         p.focus_shift_y = -0.14f;
-        p.eye_brightness = 1.18f;
-        p.rim_boost = 1.12f;
+        p.eye_brightness = 1.16f;
+        p.rim_boost = 1.06f;
         break;
     case AvatarEmotion::kHappy:
-        // Strictly no cartoon black lines: 3D obsidian cheeks arch up into glowing rainbow crescents.
+        // Strictly no cartoon black lines: 3D obsidian cheeks arch up into glowing crescents.
+        p.yaw_deg = -18.0f;
         p.pitch_deg = 3.0f;
-        p.happy_arch = 0.88f;
+        p.happy_arch = 0.84f;
         p.lower_lid = 0.06f;
-        p.warm_shift = 0.88f;
-        p.eye_brightness = 1.24f;
-        p.rim_boost = 1.10f;
+        p.warm_shift = 0.35f;
+        p.eye_brightness = 1.20f;
+        p.rim_boost = 1.05f;
         break;
     case AvatarEmotion::kSurprised:
         // Strictly no black pupils: wide dilated sockets + radiant cyan-white luminous core bloom.
-        p.scale = 1.07f;
-        p.pitch_deg = 7.0f;
-        p.left_eye_scale = 1.13f;
-        p.right_eye_scale = 1.13f;
-        p.eye_aspect_y = 1.24f;
-        p.core_bloom = 0.88f;
-        p.eye_brightness = 1.32f;
-        p.rim_boost = 1.42f;
+        p.yaw_deg = -16.0f;
+        p.scale = 1.04f;
+        p.pitch_deg = 6.0f;
+        p.left_eye_scale = 1.04f;
+        p.right_eye_scale = 1.04f;
+        p.eye_aspect_y = 1.14f;
+        p.core_bloom = 0.85f;
+        p.eye_brightness = 1.30f;
+        p.rim_boost = 1.28f;
         break;
     case AvatarEmotion::kSleep:
-        p.pitch_deg = -13.0f;
+        p.yaw_deg = -24.0f;
+        p.pitch_deg = -12.0f;
         p.roll_deg = 4.0f;
         p.upper_lid = 0.62f;
         p.lower_lid = 0.46f;
@@ -394,13 +404,24 @@ AvatarPose AvatarAnimator::Step(float dt_sec) {
     const float target_lag_x = std::clamp(-d_yaw * 0.0028f - d_roll * 0.0022f, -0.18f, 0.18f);
     const float target_lag_y = std::clamp(d_pitch * 0.0025f, -0.14f, 0.14f);
     const float kSpring = 52.0f;
-    const float kDamp = 9.0f;
+    const float kDamp = 14.5f;
     const float ax = kSpring * (target_lag_x - current_.tuft_lag_x) - kDamp * tuft_vel_x_;
     const float ay = kSpring * (target_lag_y - current_.tuft_lag_y) - kDamp * tuft_vel_y_;
     tuft_vel_x_ += ax * dt;
     tuft_vel_y_ += ay * dt;
     current_.tuft_lag_x = std::clamp(current_.tuft_lag_x + tuft_vel_x_ * dt, -0.22f, 0.22f);
     current_.tuft_lag_y = std::clamp(current_.tuft_lag_y + tuft_vel_y_ * dt, -0.16f, 0.16f);
+
+    if (std::abs(target_lag_x) < 0.001f && std::abs(current_.tuft_lag_x) < 0.003f &&
+        std::abs(tuft_vel_x_) < 0.015f) {
+        current_.tuft_lag_x = 0.0f;
+        tuft_vel_x_ = 0.0f;
+    }
+    if (std::abs(target_lag_y) < 0.001f && std::abs(current_.tuft_lag_y) < 0.003f &&
+        std::abs(tuft_vel_y_) < 0.015f) {
+        current_.tuft_lag_y = 0.0f;
+        tuft_vel_y_ = 0.0f;
+    }
 
     return current_;
 }

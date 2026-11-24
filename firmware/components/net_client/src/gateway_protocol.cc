@@ -229,10 +229,24 @@ std::string BuildWakeDetectedJson(const WakeDetectedPayload& payload) {
     return out;
 }
 
-std::string BuildSpeechStartJson(const std::string& speaker_id, const std::string& agent_id) {
+std::string BuildSpeechStartJson(const std::string& speaker_id,
+                                 const std::string& agent_id,
+                                 int speaker_role,
+                                 float confidence) {
     std::string out = "{\"type\":\"speech.start\"";
     out += ",\"speaker_id\":\"" + EscapeJsonString(speaker_id) + "\"";
     out += ",\"agent_id\":\"" + EscapeJsonString(agent_id) + "\"";
+    out += ",\"speaker_role\":" + FormatInt64(speaker_role);
+    out += ",\"confidence\":" + FormatFloat(confidence);
+    out.push_back('}');
+    return out;
+}
+
+std::string BuildSpeechStopJson(const std::string& turn_id) {
+    std::string out = "{\"type\":\"speech.stop\"";
+    if (!turn_id.empty()) {
+        out += ",\"turn_id\":\"" + EscapeJsonString(turn_id) + "\"";
+    }
     out.push_back('}');
     return out;
 }

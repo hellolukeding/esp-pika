@@ -83,7 +83,11 @@ std::string EscapeJsonString(const std::string& input);
 
 std::string BuildDeviceHelloJson(const DeviceHelloPayload& payload);
 std::string BuildWakeDetectedJson(const WakeDetectedPayload& payload);
-std::string BuildSpeechStartJson(const std::string& speaker_id, const std::string& agent_id);
+std::string BuildSpeechStartJson(const std::string& speaker_id,
+                                 const std::string& agent_id,
+                                 int speaker_role = 0,
+                                 float confidence = 0.0f);
+std::string BuildSpeechStopJson(const std::string& turn_id = "");
 std::string BuildShadowUpdateJson(const ShadowUpdatePayload& payload);
 std::string BuildCommandResultJson(const CommandResultPayload& payload);
 std::string BuildPingJson();

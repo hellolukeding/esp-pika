@@ -1,6 +1,8 @@
 #include "board.h"
+#include "chime_pcm.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -47,11 +49,14 @@ constexpr const char* kTag = "board_mosaico";
 // Official ESP-Mosaico (ESP32-S31 V1.x) pinout.
 constexpr gpio_num_t kMosaicoI2cSda = GPIO_NUM_56;
 constexpr gpio_num_t kMosaicoI2cScl = GPIO_NUM_3;
+// CoreBoard V1.2 schematic names I2S data nets from the ES8311 codec's perspective:
+//   I2S_DOUT (GPIO40) -> ES8311 pin 7 ASDOUT (ADC out -> MCU .din)
+//   I2S_DIN  (GPIO52) -> ES8311 pin 9 DSDIN  (DAC in  <- MCU .dout)
 constexpr gpio_num_t kMosaicoI2sMclk = GPIO_NUM_54;
 constexpr gpio_num_t kMosaicoI2sBclk = GPIO_NUM_37;
 constexpr gpio_num_t kMosaicoI2sWs = GPIO_NUM_49;
-constexpr gpio_num_t kMosaicoI2sDout = GPIO_NUM_40;
-constexpr gpio_num_t kMosaicoI2sDin = GPIO_NUM_52;
+constexpr gpio_num_t kMosaicoI2sMcuDout = GPIO_NUM_52;
+constexpr gpio_num_t kMosaicoI2sMcuDin = GPIO_NUM_40;
 constexpr gpio_num_t kMosaicoPaCtrlPin = GPIO_NUM_45;
 
 // CO5300 480x480 QSPI AMOLED display + CST9220 capacitive touch pins (DISP_PWR_EN is active LOW).
@@ -64,7 +69,7 @@ constexpr gpio_num_t kMosaicoDispD2Pin = GPIO_NUM_35;
 constexpr gpio_num_t kMosaicoDispD3Pin = GPIO_NUM_9;
 constexpr gpio_num_t kMosaicoDispRstPin = GPIO_NUM_44;
 constexpr gpio_num_t kMosaicoTouchIntPin = GPIO_NUM_6;
-constexpr int kDisplayStripRows = 32;
+constexpr int kDisplayStripRows = 24;
 
 // Onboard I2C0 7-bit device addresses.
 constexpr uint8_t kMosaicoEs8311Addr7Bit = 0x19;
@@ -181,6 +186,8 @@ public:
         }
 
         i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+        chan_cfg.dma_desc_num = 8;
+        chan_cfg.dma_frame_num = 320; // 8 * 320 = 2560 samples (160ms hardware DMA cushion @ 16kHz)
         chan_cfg.auto_clear = true;
         if (i2s_new_channel(&chan_cfg, &tx_chan_, &rx_chan_) != ESP_OK) {
             ESP_LOGE(kTag, "i2s_new_channel failed");
@@ -194,8 +201,8 @@ public:
                 .mclk = kMosaicoI2sMclk,
                 .bclk = kMosaicoI2sBclk,
                 .ws = kMosaicoI2sWs,
-                .dout = kMosaicoI2sDout,
-                .din = kMosaicoI2sDin,
+                .dout = kMosaicoI2sMcuDout,
+                .din = kMosaicoI2sMcuDin,
                 .invert_flags = {false, false, false},
             },
         };
@@ -230,6 +237,7 @@ public:
         es_cfg.pa_reverted = false;
         es_cfg.use_mclk = true;
         es_cfg.digital_mic = false;
+        es_cfg.no_dac_ref = true;
         es_cfg.mclk_div = 256;
         const audio_codec_if_t* codec_if = es8311_codec_new(&es_cfg);
 
@@ -251,12 +259,84 @@ public:
             ESP_LOGE(kTag, "esp_codec_dev_open failed");
             return false;
         }
+        // On ESP32-S31 (SOC_I2S_HW_VERSION_2), TX duplicates mono samples to both L/R I2S slots
+        // only when slot_mode == MONO and slot_mask == I2S_STD_SLOT_BOTH (leaving RX unchanged).
+        i2s_channel_disable(tx_chan_);
+        i2s_std_slot_config_t tx_slot =
+            I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
+        tx_slot.slot_mask = I2S_STD_SLOT_BOTH;
+        if (i2s_channel_reconfig_std_slot(tx_chan_, &tx_slot) != ESP_OK) {
+            ESP_LOGW(kTag, "i2s_channel_reconfig_std_slot(TX BOTH) failed");
+        }
+        i2s_channel_enable(tx_chan_);
+
+        esp_codec_dev_vol_map_t vol_map[2] = {
+            {.vol = 0, .db_value = -50.0f},
+            {.vol = 100, .db_value = 12.0f},
+        };
+        esp_codec_dev_vol_curve_t vol_curve = {
+            .vol_map = vol_map,
+            .count = 2,
+        };
+        esp_codec_dev_set_vol_curve(codec_dev_, &vol_curve);
+        esp_codec_dev_set_out_mute(codec_dev_, false);
         esp_codec_dev_set_out_vol(codec_dev_, volume_);
-        esp_codec_dev_set_in_gain(codec_dev_, 24.0f);
-        ESP_LOGI(kTag, "ESP-Mosaico ES8311 initialized (in=%luHz out=%luHz PA=GPIO%d)",
-                 static_cast<unsigned long>(sample_rate_in),
-                 static_cast<unsigned long>(sample_rate_out),
-                 kMosaicoPaCtrlPin);
+        esp_codec_dev_set_in_gain(codec_dev_, 30.0f);
+
+        gpio_config_t pa_io = {};
+        pa_io.pin_bit_mask = (1ULL << static_cast<uint32_t>(kMosaicoPaCtrlPin));
+        pa_io.mode = GPIO_MODE_INPUT_OUTPUT;
+        pa_io.pull_up_en = GPIO_PULLUP_DISABLE;
+        pa_io.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        pa_io.intr_type = GPIO_INTR_DISABLE;
+        gpio_config(&pa_io);
+        gpio_set_level(kMosaicoPaCtrlPin, 1);
+
+        // Allow ES8311 VMID (1uF) and NS4150B Bypass (1uF) pop-suppression to unmute before chime.
+        vTaskDelay(pdMS_TO_TICKS(180));
+
+        int r00 = -1, r09 = -1, r0d = -1, r12 = -1, r13 = -1, r14 = -1, r16 = -1, r17 = -1;
+        int r31 = -1, r32 = -1, r44 = -1;
+        esp_codec_dev_read_reg(codec_dev_, 0x00, &r00);
+        esp_codec_dev_read_reg(codec_dev_, 0x09, &r09);
+        esp_codec_dev_read_reg(codec_dev_, 0x0D, &r0d);
+        esp_codec_dev_read_reg(codec_dev_, 0x12, &r12);
+        esp_codec_dev_read_reg(codec_dev_, 0x13, &r13);
+        esp_codec_dev_read_reg(codec_dev_, 0x14, &r14);
+        esp_codec_dev_read_reg(codec_dev_, 0x16, &r16);
+        esp_codec_dev_read_reg(codec_dev_, 0x17, &r17);
+        esp_codec_dev_read_reg(codec_dev_, 0x31, &r31);
+        esp_codec_dev_read_reg(codec_dev_, 0x32, &r32);
+        esp_codec_dev_read_reg(codec_dev_, 0x44, &r44);
+        ESP_LOGI(kTag,
+                 "ES8311 regs: 00=%02x 09=%02x 0D=%02x 12=%02x 13=%02x 14=%02x 16=%02x 17=%02x 31=%02x 32=%02x 44=%02x PA=%d",
+                 r00, r09, r0d, r12, r13, r14, r16, r17, r31, r32, r44, gpio_get_level(kMosaicoPaCtrlPin));
+
+        {
+            size_t wrote = 0;
+            size_t chime_samples = 0;
+            const int16_t* chime_pcm = GetSystemChimePcm16k(&chime_samples);
+            constexpr size_t kChunkSamples = 320; // 20ms @ 16kHz
+            int16_t* dma_chunk = static_cast<int16_t*>(
+                heap_caps_malloc(kChunkSamples * sizeof(int16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+            if (dma_chunk != nullptr && chime_pcm != nullptr) {
+                for (size_t offset = 0; offset < chime_samples; offset += kChunkSamples) {
+                    const size_t n = std::min(kChunkSamples, chime_samples - offset);
+                    std::memcpy(dma_chunk, chime_pcm + offset, n * sizeof(int16_t));
+                    wrote += WritePcm(dma_chunk, n, 100);
+                }
+            }
+            if (dma_chunk != nullptr) {
+                heap_caps_free(dma_chunk);
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+            ESP_LOGI(kTag, "ESP-Mosaico ES8311 initialized (in=%luHz out=%luHz PA=GPIO%d vol=%d chime=%u)",
+                     static_cast<unsigned long>(sample_rate_in),
+                     static_cast<unsigned long>(sample_rate_out),
+                     kMosaicoPaCtrlPin,
+                     volume_,
+                     static_cast<unsigned>(wrote));
+        }
         return true;
 #else
         (void)sample_rate_in;
@@ -319,7 +399,7 @@ public:
     int Volume() const override { return volume_; }
 
 private:
-    int volume_ = 75;
+    int volume_ = 85;
 #ifdef ESP_PLATFORM
     i2c_master_bus_handle_t i2c_bus_ = nullptr;
     i2s_chan_handle_t tx_chan_ = nullptr;
@@ -350,9 +430,11 @@ public:
             vSemaphoreDelete(tx_done_sem_);
             tx_done_sem_ = nullptr;
         }
-        if (dma_strip_ != nullptr) {
-            heap_caps_free(dma_strip_);
-            dma_strip_ = nullptr;
+        for (int i = 0; i < 2; ++i) {
+            if (dma_strip_[i] != nullptr) {
+                heap_caps_free(dma_strip_[i]);
+                dma_strip_[i] = nullptr;
+            }
         }
 #endif
         ready_ = false;
@@ -382,16 +464,18 @@ public:
         gpio_set_level(kMosaicoDispPwrEnPin, 0);
         vTaskDelay(pdMS_TO_TICKS(25));
 
-        // 2. Allocate DMA strip bounce buffer in internal DRAM (framebuffer lives in PSRAM).
+        // 2. Allocate ping-pong DMA strip bounce buffers in internal DRAM.
         const size_t strip_bytes =
             static_cast<size_t>(kDisplayWidth) * kDisplayStripRows * sizeof(uint16_t);
-        dma_strip_ =
-            static_cast<uint16_t*>(heap_caps_malloc(strip_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
-        if (dma_strip_ == nullptr) {
-            ESP_LOGE(kTag, "Failed to allocate CO5300 DMA strip buffer (%u bytes)",
-                     static_cast<unsigned>(strip_bytes));
-            Deinit();
-            return false;
+        for (int i = 0; i < 2; ++i) {
+            dma_strip_[i] = static_cast<uint16_t*>(
+                heap_caps_malloc(strip_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+            if (dma_strip_[i] == nullptr) {
+                ESP_LOGE(kTag, "Failed to allocate CO5300 DMA strip[%d] (%u bytes)", i,
+                         static_cast<unsigned>(strip_bytes));
+                Deinit();
+                return false;
+            }
         }
 
         tx_done_sem_ = xSemaphoreCreateBinary();
@@ -483,8 +567,9 @@ public:
                      int stride_pixels) override {
 #ifdef ESP_PLATFORM
         std::lock_guard<std::mutex> lock(mu_);
-        if (!ready_ || dma_strip_ == nullptr || panel_handle_ == nullptr ||
-            full_framebuffer == nullptr || stride_pixels <= 0 || w <= 0 || h <= 0) {
+        if (!ready_ || dma_strip_[0] == nullptr || dma_strip_[1] == nullptr ||
+            panel_handle_ == nullptr || full_framebuffer == nullptr || stride_pixels <= 0 ||
+            w <= 0 || h <= 0) {
             return false;
         }
         // CO5300 requires even-aligned CASET/RASET boundaries.
@@ -499,9 +584,15 @@ public:
         const int max_strip_pixels = kDisplayWidth * kDisplayStripRows;
         const int max_rows = std::max(1, max_strip_pixels / rw);
 
+        // Ping-pong overlap: CPU byte-swaps next strip into dma_strip_[buf_idx] while
+        // previous strip transfers asynchronously over QSPI DMA.
+        int buf_idx = 0;
+        bool dma_in_flight = false;
+        xSemaphoreTake(tx_done_sem_, 0);
+
         for (int row = y0; row < y1; row += max_rows) {
             const int rows = std::min(max_rows, y1 - row);
-            uint16_t* dst = dma_strip_;
+            uint16_t* dst = dma_strip_[buf_idx];
             for (int r = 0; r < rows; ++r) {
                 const uint16_t* src =
                     full_framebuffer + static_cast<size_t>(row + r) * stride_pixels + x0;
@@ -509,14 +600,23 @@ public:
                     *dst++ = __builtin_bswap16(src[c]);
                 }
             }
-            xSemaphoreTake(tx_done_sem_, 0);
-            if (esp_lcd_panel_draw_bitmap(panel_handle_, x0, row, x1, row + rows, dma_strip_) !=
-                ESP_OK) {
+            if (dma_in_flight) {
+                if (xSemaphoreTake(tx_done_sem_, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                    ESP_LOGW(kTag, "CO5300 DMA timeout at y=%d", row);
+                    return false;
+                }
+            }
+            if (esp_lcd_panel_draw_bitmap(panel_handle_, x0, row, x1, row + rows,
+                                          dma_strip_[buf_idx]) != ESP_OK) {
                 ESP_LOGE(kTag, "CO5300 draw_bitmap failed at y=%d", row);
                 return false;
             }
+            dma_in_flight = true;
+            buf_idx ^= 1;
+        }
+        if (dma_in_flight) {
             if (xSemaphoreTake(tx_done_sem_, pdMS_TO_TICKS(1000)) != pdTRUE) {
-                ESP_LOGW(kTag, "CO5300 DMA timeout at y=%d", row);
+                ESP_LOGW(kTag, "CO5300 final DMA timeout");
                 return false;
             }
         }
@@ -582,15 +682,16 @@ private:
     }
 
     void ClearBlackLocked() {
-        if (dma_strip_ == nullptr || panel_handle_ == nullptr) {
+        if (dma_strip_[0] == nullptr || panel_handle_ == nullptr) {
             return;
         }
-        std::memset(dma_strip_, 0, static_cast<size_t>(kDisplayWidth) * kDisplayStripRows * sizeof(uint16_t));
+        std::memset(dma_strip_[0], 0,
+                    static_cast<size_t>(kDisplayWidth) * kDisplayStripRows * sizeof(uint16_t));
         for (int y0 = 0; y0 < kDisplayHeight; y0 += kDisplayStripRows) {
             const int rows = std::min(kDisplayStripRows, kDisplayHeight - y0);
             xSemaphoreTake(tx_done_sem_, 0);
-            if (esp_lcd_panel_draw_bitmap(panel_handle_, 0, y0, kDisplayWidth, y0 + rows, dma_strip_) ==
-                ESP_OK) {
+            if (esp_lcd_panel_draw_bitmap(panel_handle_, 0, y0, kDisplayWidth, y0 + rows,
+                                          dma_strip_[0]) == ESP_OK) {
                 xSemaphoreTake(tx_done_sem_, pdMS_TO_TICKS(1000));
             }
         }
@@ -598,7 +699,7 @@ private:
 
     esp_lcd_panel_io_handle_t io_handle_ = nullptr;
     esp_lcd_panel_handle_t panel_handle_ = nullptr;
-    uint16_t* dma_strip_ = nullptr;
+    uint16_t* dma_strip_[2] = {nullptr, nullptr};
     SemaphoreHandle_t tx_done_sem_ = nullptr;
     bool spi_bus_ready_ = false;
 #endif
@@ -745,10 +846,18 @@ public:
         }
         if (sensor_type == "imu" || sensor_type == "accel_x" || sensor_type == "accel_y" ||
             sensor_type == "accel_z") {
-            float ax = 0.0f;
-            float ay = 0.0f;
-            float az = 0.0f;
-            if (bmi_present_ && bmi270_get_acce_data(bmi_handle_, &ax, &ay, &az) == ESP_OK) {
+            float ax = cached_ax_;
+            float ay = cached_ay_;
+            float az = cached_az_;
+            bool ok = bmi_present_ && (cached_imu_ms_ >= 0 && (ts - cached_imu_ms_) <= 8);
+            if (!ok && bmi_present_ && bmi270_get_acce_data(bmi_handle_, &ax, &ay, &az) == ESP_OK) {
+                cached_ax_ = ax;
+                cached_ay_ = ay;
+                cached_az_ = az;
+                cached_imu_ms_ = ts;
+                ok = true;
+            }
+            if (ok) {
                 if (sensor_type == "accel_x") {
                     return SensorReading{true, sensor_type, ax, "g", ts};
                 }
@@ -812,6 +921,10 @@ private:
     bmi270_handle_t* bmi_handle_ = nullptr;
     bool bq_present_ = false;
     bool bmi_present_ = false;
+    float cached_ax_ = 0.0f;
+    float cached_ay_ = 0.0f;
+    float cached_az_ = 1.0f;
+    int64_t cached_imu_ms_ = -1;
 #endif
 };
 
@@ -847,11 +960,16 @@ public:
 
     void Deinit() {
 #ifdef ESP_PLATFORM
+        if (isr_attached_) {
+            gpio_isr_handler_remove(kMosaicoTouchIntPin);
+            isr_attached_ = false;
+        }
         if (cst_dev_ != nullptr) {
             i2c_master_bus_rm_device(cst_dev_);
             cst_dev_ = nullptr;
         }
         present_ = false;
+        was_pressed_ = false;
 #endif
     }
 
@@ -866,7 +984,7 @@ public:
         int_cfg.mode = GPIO_MODE_INPUT;
         int_cfg.pull_up_en = GPIO_PULLUP_ENABLE;
         int_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
-        int_cfg.intr_type = GPIO_INTR_DISABLE;
+        int_cfg.intr_type = GPIO_INTR_NEGEDGE;
         gpio_config(&int_cfg);
 
         // Do NOT toggle GPIO44 here because CO5300 already reset the shared RST line.
@@ -882,9 +1000,15 @@ public:
             ESP_LOGW(kTag, "CST9220 i2c_master_bus_add_device failed");
             return false;
         }
+        const esp_err_t isr_err = gpio_install_isr_service(0);
+        if (isr_err == ESP_OK || isr_err == ESP_ERR_INVALID_STATE) {
+            if (gpio_isr_handler_add(kMosaicoTouchIntPin, &MosaicoTouch::OnTouchIsr, this) == ESP_OK) {
+                isr_attached_ = true;
+            }
+        }
         present_ = true;
-        ESP_LOGI(kTag, "CST9220 touch initialized at 0x%02X (INT=GPIO%d)",
-                 kMosaicoCst9220Addr7Bit, kMosaicoTouchIntPin);
+        ESP_LOGI(kTag, "CST9220 touch initialized at 0x%02X (INT=GPIO%d irq=%s)",
+                 kMosaicoCst9220Addr7Bit, kMosaicoTouchIntPin, isr_attached_ ? "yes" : "poll");
         return true;
 #else
         return true;
@@ -901,21 +1025,29 @@ public:
         if (!present_ || cst_dev_ == nullptr) {
             return false;
         }
+        // Zero-overhead gate: skip I2C transaction completely when untouched and no edge IRQ latched.
+        if (!irq_pending_.exchange(false, std::memory_order_acquire) &&
+            gpio_get_level(kMosaicoTouchIntPin) != 0 && !was_pressed_) {
+            return false;
+        }
         const uint8_t reg[2] = {0xD0, 0x00};
         uint8_t data[7] = {};
-        if (i2c_master_transmit_receive(cst_dev_, reg, sizeof(reg), data, sizeof(data), 30) !=
+        if (i2c_master_transmit_receive(cst_dev_, reg, sizeof(reg), data, sizeof(data), 10) !=
             ESP_OK) {
+            was_pressed_ = false;
             return false;
         }
         if (data[6] != 0xAB) {
+            was_pressed_ = false;
             return false;
         }
         // Required CST9220 handshake ACK so the internal report FIFO keeps advancing.
         const uint8_t ack[3] = {0xD0, 0x00, 0xAB};
-        i2c_master_transmit(cst_dev_, ack, sizeof(ack), 30);
+        i2c_master_transmit(cst_dev_, ack, sizeof(ack), 10);
 
         const uint8_t fingers = data[5] & 0x7F;
         const bool contact = (fingers > 0) && ((data[0] & 0x0F) == 0x06);
+        was_pressed_ = contact;
         out->points = fingers;
         out->pressed = contact;
         if (contact) {
@@ -933,9 +1065,19 @@ public:
 
 private:
 #ifdef ESP_PLATFORM
+    static void IRAM_ATTR OnTouchIsr(void* arg) {
+        auto* self = static_cast<MosaicoTouch*>(arg);
+        if (self != nullptr) {
+            self->irq_pending_.store(true, std::memory_order_release);
+        }
+    }
+
     mutable std::mutex mu_;
     i2c_master_bus_handle_t i2c_bus_ = nullptr;
     i2c_master_dev_handle_t cst_dev_ = nullptr;
+    std::atomic<bool> irq_pending_{false};
+    bool isr_attached_ = false;
+    bool was_pressed_ = false;
     bool present_ = false;
 #endif
 };
@@ -978,7 +1120,14 @@ public:
             return false;
         }
 
+        if (!display_.Init()) {
 #ifdef ESP_PLATFORM
+            ESP_LOGW(kTag, "CO5300 AMOLED display init failed; continuing headless");
+#endif
+        }
+
+#ifdef ESP_PLATFORM
+        // Probe I2C0 after display_.Init() enables VCC_3V3 / CODEC_3V3 (GPIO60 active LOW).
         if (!i2c_bus_.Init()) {
             return false;
         }
@@ -987,12 +1136,6 @@ public:
         touch_.SetI2cBus(i2c_bus_.Handle());
         audio_.SetI2cBus(i2c_bus_.Handle());
 #endif
-
-        if (!display_.Init()) {
-#ifdef ESP_PLATFORM
-            ESP_LOGW(kTag, "CO5300 AMOLED display init failed; continuing headless");
-#endif
-        }
         touch_.Init();
         sensors_.Init();
         return audio_.Init(16000, 16000);

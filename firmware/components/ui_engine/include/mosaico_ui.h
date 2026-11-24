@@ -12,11 +12,40 @@
 
 namespace esp_pika {
 
-/// Snapshot of system, audio, power, and sensor telemetry displayed by MosaicoUi.
+/// High-level Wi-Fi connection / provisioning mode displayed by MosaicoUi.
+enum class WifiUiMode {
+    kOffline = 0,
+    kConnecting,
+    kConnected,
+    kPortal,
+};
+
+/// Single Wi-Fi row displayed in the Mosaico on-screen Wi-Fi manager.
+struct WifiUiEntry {
+    std::string ssid;
+    int rssi = -100;
+    bool secure = true;
+    bool saved = false;
+    bool connected = false;
+};
+
+/// Snapshot of system, audio, power, sensor, and Wi-Fi telemetry displayed by MosaicoUi.
 struct UiSnapshot {
     bool wifi_connected = false;
     bool gateway_connected = false;
+    WifiUiMode wifi_mode = WifiUiMode::kOffline;
+    bool wifi_portal_active = false;
     std::string mac = "00:00:00:00:00:00";
+    std::string wifi_ssid;
+    std::string wifi_ip;
+    int wifi_rssi = -100;
+    std::string ap_ssid;
+    std::string ap_ip = "192.168.4.1";
+    std::string wifi_status_msg;
+    bool wifi_scanning = false;
+    uint32_t wifi_revision = 0;
+    std::vector<WifiUiEntry> wifi_entries;
+
     std::string session_tag = "SESSION-01";
     std::string status_tag; // If non-empty, overrides right pill (e.g. "THINK", "LISTEN")
 
@@ -40,10 +69,16 @@ struct UiCallbacks {
     std::function<void(uint8_t brightness)> on_brightness_change;
     std::function<void()> on_long_press_wake;
     std::function<void(AvatarEmotion emotion)> on_quick_emotion;
+    std::function<void()> on_wifi_scan;
+    std::function<void(const std::string& ssid, const std::string& password, bool use_saved)>
+        on_wifi_connect;
+    std::function<void(const std::string& ssid)> on_wifi_forget;
+    std::function<void(bool enable)> on_wifi_toggle_portal;
+    std::function<void()> on_wifi_panel_open;
 };
 
 /// 480x480 ESP-Mosaico compositor combining minimal HUD, 3D avatar stage,
-/// auto-fading bottom captions, and CST9220 swipe-down telemetry/control drawer.
+/// auto-fading bottom captions, CST9220 swipe-down telemetry drawer, and native Wi-Fi UI.
 class MosaicoUi {
 public:
     static constexpr int kWidth = 480;
@@ -68,8 +103,15 @@ public:
     void SetAudioEnergy(float rms_0_to_1);
     void OnTouch(const TouchPoint& tp, int64_t now_ms, UiSnapshot* mutable_state);
 
+    void OpenWifiMenu();
+    void CloseWifiOverlay();
+
     bool IsDrawerOpen() const { return drawer_open_; }
+    bool IsOverlayOpen() const { return drawer_open_ || view_ != UiView::kAvatar; }
+    bool IsWifiMenuOpen() const { return view_ == UiView::kWifiMenu; }
+    bool IsWifiKeyboardOpen() const { return view_ == UiView::kWifiKeyboard; }
     AvatarEmotion EffectiveEmotion() const { return animator_.EffectiveEmotion(); }
+    const Avatar3DRenderer& Renderer() const { return renderer_; }
 
     /// Advances animation & renders modified regions into `framebuffer_`.
     void StepAndRender(float dt_sec, const UiSnapshot& state, std::vector<UiRect>* out_dirty);
@@ -79,11 +121,30 @@ public:
                                  const UiSnapshot& state,
                                  const std::string& caption = "");
     void RenderPreviewDrawer(const UiSnapshot& state);
+    void RenderPreviewWifiMenu(const UiSnapshot& state);
+    void RenderPreviewWifiKeyboard(const std::string& ssid,
+                                     const std::string& password,
+                                     const UiSnapshot& state);
 
 private:
+    enum class UiView {
+        kAvatar = 0,
+        kWifiMenu,
+        kWifiKeyboard,
+    };
+
+    enum class KbLayer {
+        kLower = 0,
+        kUpper,
+        kDigits,
+        kSymbols,
+    };
+
     void RenderTopHud(const UiSnapshot& state, AvatarEmotion active_emotion);
     void RenderBottomCaption(const UiSnapshot& state, float audio_energy);
     void RenderDrawerOverlay(const UiSnapshot& state, int top_y);
+    void RenderWifiMenu(const UiSnapshot& state);
+    void RenderWifiKeyboard(const UiSnapshot& state, int64_t now_ms);
     void ClearFramebuffer();
     uint16_t* RawFb() { return framebuffer_; }
 
@@ -97,6 +158,8 @@ private:
 #endif
     bool ready_ = false;
     bool force_full_refresh_ = true;
+    bool has_prev_pose_ = false;
+    AvatarPose prev_pose_{};
 
     // Caption fade state.
     std::string caption_text_;
@@ -107,6 +170,7 @@ private:
     // HUD diff tracking so static top bar isn't needlessly re-flushed every frame.
     bool last_wifi_ = false;
     bool last_gateway_ = false;
+    WifiUiMode last_wifi_mode_ = WifiUiMode::kOffline;
     int last_bat_pct_ = -1;
     bool last_charging_ = false;
     std::string last_right_pill_;
@@ -115,6 +179,18 @@ private:
     bool drawer_open_ = false;
     float drawer_progress_ = 0.0f; // 0.0 = closed, 1.0 = full open
     float last_drawer_progress_ = 0.0f;
+
+    // Native Wi-Fi configuration / touch keyboard overlay state.
+    UiView view_ = UiView::kAvatar;
+    int wifi_page_ = 0;
+    std::string kb_ssid_;
+    std::string kb_password_;
+    KbLayer kb_layer_ = KbLayer::kLower;
+    int kb_flash_key_ = -1;
+    int64_t kb_flash_until_ms_ = 0;
+    bool overlay_dirty_ = false;
+    uint32_t last_overlay_wifi_rev_ = 0;
+    int64_t overlay_clock_ms_ = 0;
 
     // Touch gesture tracking.
     bool touch_down_ = false;

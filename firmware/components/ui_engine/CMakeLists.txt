@@ -11,4 +11,4 @@ idf_component_register(
 )
 
 target_compile_features(${COMPONENT_LIB} PUBLIC cxx_std_20)
-target_compile_options(${COMPONENT_LIB} PRIVATE -O2)
+target_compile_options(${COMPONENT_LIB} PRIVATE -O3 -ffast-math -fno-math-errno)

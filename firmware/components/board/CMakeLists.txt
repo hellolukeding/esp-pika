@@ -2,6 +2,7 @@ set(BOARD_SRCS
     "src/board_s31_mosaico.cc"
     "src/board_s31_coreboard.cc"
     "src/board_s31_korvo.cc"
+    "src/chime_pcm.cc"
 )
 
 idf_component_register(

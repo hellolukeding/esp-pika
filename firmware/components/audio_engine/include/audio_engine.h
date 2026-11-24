@@ -22,8 +22,8 @@ struct AudioEngineConfig {
     uint32_t uplink_sample_rate = 16000;
     uint32_t downlink_sample_rate = 24000;
     uint16_t frame_ms = 60;
-    size_t max_send_frames = 40;   // 40 * 60ms = 2.4s cap per architecture.md
-    size_t max_decode_frames = 20; // 20 * 60ms = 1.2s cap per architecture.md
+    size_t max_send_frames = 40;    // 40 * 60ms = 2.4s cap per architecture.md
+    size_t max_decode_frames = 512; // Absorb burst DeepSeek WS TTS packets (~10.2s buffer)
     AfePipelineConfig afe;
 };
 
@@ -66,6 +66,9 @@ public:
     /// Enqueues a 24kHz Opus downlink frame into bounded DecodeQ.
     bool EnqueueDownlinkOpus(const uint8_t* frame, size_t len);
 
+    /// Triggers an immediate local ascending wake-confirmation chime on Core 0.
+    void PlayWakeChime();
+
     /// Drains uplink SendQ into the supplied sender callback; returns count flushed.
     size_t FlushUplink(const OpusUplinkCallback& sender);
 
@@ -76,7 +79,13 @@ public:
 
     /// Normalized real-time microphone and speaker energy in [0.0, 1.0] (lock-free).
     float MicLevel() const { return mic_rms_.load(std::memory_order_relaxed); }
+    float CleanMicLevel() const { return clean_mic_rms_.load(std::memory_order_relaxed); }
     float SpeakerLevel() const { return spk_rms_.load(std::memory_order_relaxed); }
+    bool IsVadSpeaking() const { return vad_speaking_.load(std::memory_order_relaxed); }
+    bool IsWakeChimePlaying() const {
+        return wake_chime_playing_.load(std::memory_order_acquire) ||
+               (skip_uplink_samples_.load(std::memory_order_relaxed) > 0);
+    }
 
 private:
     void HandleAfeStep(const AfeStepResult& step);
@@ -92,12 +101,18 @@ private:
     VadStateCallback on_vad_;
     std::atomic<bool> running_{false};
     std::atomic<bool> uplink_enabled_{false};
+    std::atomic<bool> wake_chime_pending_{false};
+    std::atomic<bool> wake_chime_playing_{false};
+    std::atomic<uint32_t> skip_uplink_samples_{0};
     std::atomic<float> mic_rms_{0.0f};
+    std::atomic<float> clean_mic_rms_{0.0f};
     std::atomic<float> spk_rms_{0.0f};
+    std::atomic<bool> vad_speaking_{false};
 
 #ifdef ESP_PLATFORM
     int16_t* dma_rx_pcm_ = nullptr;
     int16_t* dma_tx_pcm_ = nullptr;
+    size_t tx_max_samples_ = 0;
     uint8_t* spiram_opus_scratch_ = nullptr;
     void* opus_enc_ = nullptr;
     void* opus_dec_ = nullptr;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -41,12 +42,13 @@ private:
 struct AfePipelineConfig {
     uint32_t sample_rate = 16000;
     bool enable_aec = true;
-    bool enable_ns = true;
+    bool enable_ns = false;
     bool enable_vadnet = true;
     bool enable_wakenet = true;
     uint32_t pre_roll_ms = 400;
     uint32_t wake_vp_window_ms = 1500;
-    std::string wake_word = "hi_esp";
+    std::string wake_word = "nihao_xiaoyuan";
+    std::string wake_pinyin = "ni hao xiao yuan";
     float vad_energy_threshold = 450.0f;
     uint32_t vad_hangover_ms = 400;
 };
@@ -87,6 +89,7 @@ public:
 
     size_t FeedSampleRate() const { return cfg_.sample_rate; }
     bool IsSpeaking() const { return speaking_; }
+    void SetWakeDetectionEnabled(bool enabled) { wake_enabled_.store(enabled, std::memory_order_relaxed); }
 
 private:
     float UpdateNoiseAndComputeSnr(const int16_t* pcm, size_t samples, float* out_rms);
@@ -95,6 +98,7 @@ private:
     std::unique_ptr<PcmPreRollBuffer> pre_roll_;
     bool initialized_ = false;
     bool speaking_ = false;
+    std::atomic<bool> wake_enabled_{true};
     uint32_t hangover_elapsed_ms_ = 0;
     float noise_floor_rms_ = 80.0f;
     float last_snr_db_ = 0.0f;
@@ -102,6 +106,13 @@ private:
 #ifdef ESP_PLATFORM
     void* afe_handle_ = nullptr;
     const void* afe_iface_ = nullptr;
+    size_t feed_chunksize_ = 0;
+    std::vector<int16_t> feed_carry_;
+    void* mn_handle_ = nullptr;
+    const void* mn_iface_ = nullptr;
+    size_t mn_chunksize_ = 0;
+    int mn_hangover_chunks_ = 0;
+    std::vector<int16_t> mn_carry_;
 #endif
 };
 

@@ -44,6 +44,7 @@ bool WritePpm(const char* path, int w, int h, const uint16_t* rgb565) {
 int main(int argc, char** argv) {
     const char* expr_out = (argc > 1) ? argv[1] : "expressions.ppm";
     const char* drawer_out = (argc > 2) ? argv[2] : "drawer.ppm";
+    const char* hero_out = (argc > 3) ? argv[3] : nullptr;
 
     MosaicoUi ui;
     if (!ui.Init()) {
@@ -128,6 +129,14 @@ int main(int argc, char** argv) {
     ui.RenderPreviewDrawer(state);
     if (!WritePpm(drawer_out, MosaicoUi::kWidth, MosaicoUi::kHeight, ui.Framebuffer())) {
         return 1;
+    }
+
+    // 3. Render 1:1 native 480x480 Hero Idle preview for side-by-side comparison.
+    if (hero_out != nullptr) {
+        ui.RenderPreviewExpression(AvatarEmotion::kIdle, state, "");
+        if (!WritePpm(hero_out, MosaicoUi::kWidth, MosaicoUi::kHeight, ui.Framebuffer())) {
+            return 1;
+        }
     }
 
     std::printf("Wrote %s (%dx%d) and %s (480x480)\n", expr_out, kSheetW, kSheetH, drawer_out);

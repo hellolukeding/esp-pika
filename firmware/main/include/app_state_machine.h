@@ -14,6 +14,7 @@ enum class DeviceState {
     kListening,
     kSpeaking,
     kOffline,
+    kProvisioning,
 };
 
 const char* DeviceStateName(DeviceState state);
@@ -27,6 +28,8 @@ public:
     DeviceState OnBoot();
     DeviceState OnWifiConnected();
     DeviceState OnWifiLost();
+    DeviceState OnPortalStarted();
+    DeviceState OnPortalStopped(bool wifi_connected);
     DeviceState OnGatewayDiscovered();
     DeviceState OnWsConnected();
     DeviceState OnDeviceWelcome();
@@ -34,6 +37,7 @@ public:
     DeviceState OnLocalWakeTriggered();
     DeviceState OnWakeAccept();
     DeviceState OnWakeSuppress();
+    DeviceState OnSpeechStopped();
     DeviceState OnDownlinkAudioStart();
     DeviceState OnPlaybackFinished();
 
