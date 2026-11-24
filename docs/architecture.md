@@ -175,7 +175,21 @@ flowchart LR
 * **职责边界**：端侧 VAD 负责本地 LED/表情反馈、静音过滤省流量、以及切分有效语音段给端侧声纹；**不直接强行截断云端对话轮次**，最终的语义端点检测（Endpointing）由网关/ASR 结合语意决定。
 * **超低功耗模式（可选）**：电池场景下，主核进入 Light/Deep-sleep，由 ESP32-S31 的 **ULP LP Core** 执行轻量能量/过零率检测，超过阈值再唤醒 HP Core 运行 VADNet 与 WakeNet。
 
-### 4.3 端侧声纹识别（On-Device Voiceprint）方案
+### 4.3 设备端 Wi-Fi 管理、自动联网与双模配网（ESP-Mosaico）
+
+1. **多网络加密 NVS 持久化（`wifi_store`）**：
+   * 在 NVS 命名空间 `wifi_store` 中保存最多 **8 组** Wi-Fi 凭据（按 `last_used_seq` LRU 排序）及可选网关直连覆盖地址（`gateway_override: host:port`），通过二进制魔数 + FNV-1a 校验持久化；启用量产加密时随 NVS 加密一并受硬件密钥保护。
+   * 当 NVS 凭据库为空且编译期配置了 `CONFIG_ESP_PIKA_WIFI_SSID` 时，首次启动自动写入一条种子记录（不覆盖用户后续新增或遗忘操作）。
+2. **自动联网、故障转移与断线重连**：
+   * 上电后由运行在 Core 1 片内 DRAM 栈的独立 `NetWorkerTask`（不阻塞 Core 0 音频与 `UiRenderTask` / `app_main` 20ms 主循环）异步执行：优先连接最近一次成功的 Wi-Fi；若失败则主动扫描 2.4 GHz 信道，按信号强度（RSSI）降序依次尝试当前可见的已保存网络。
+   * 运行时若意外掉线，先按退避间隔（2s / 4s / 6s）重试当前网络（最多 3 次），随后自动扫描并故障转移至其他已保存网络；若仍无可用网络，则自动拉起 SoftAP Captive Portal 等待配网（当自动进入配网模式且无手机/客户端连入 AP 时，每 45 秒周期性重扫并在已保存网络恢复后自动回连）。
+3. **双模配网与本地网络切换**：
+   * **端侧屏幕直连配网（ESP-Mosaico 480×480 触摸屏）**：点击顶部状态栏 Wi-Fi/链路图标或下拉控制抽屉的 `WIFI >` 按钮进入独立 Wi-Fi 管理页，支持扫描、切换已保存/开放/加密网络、遗忘凭据、开关本地配网热点，以及调用内置四层触摸软键盘（小写 QWERTY / 大写 / `123` / `SYM`）输入 Wi-Fi 密码。
+   * **零 App SoftAP Captive Portal（`ESP-Mosaico-XXXX`）**：在 `WIFI_MODE_APSTA` 下开启开放热点（后缀取自 eFuse MAC 末 4 位大写十六进制），启动 Core 1 `DnsPortalTask`（UDP 53 通配解析至 `192.168.4.1`）与 `esp_http_server` 配网页面及 REST API（`/api/wifi/status`、`/api/wifi/scan`、`/api/wifi/connect`、`/api/wifi/forget`、`/api/wifi/gateway`、通配 302 跳转）。**安全边界**：Portal 仅在配网/热点模式开启，STA 连网成功并展示新 IP 后约 4 秒自动关闭 HTTP/DNS 与 SoftAP，切回纯 `WIFI_MODE_STA`，不在正常在线态常驻开放未认证 HTTP 端口。
+4. **切网无缝恢复网关会话**：
+   * Wi-Fi 连接建立、切换 SSID 或 IP 变更时，应用层断开旧 WebSocket 并触发 mDNS `_esp-gateway._tcp.local` 重发现（若无 mDNS 响应，优先采用用户在配网页/NVS 设置的网关覆盖地址，否则回退 Kconfig 默认网关），无需重启设备即可自动重建与网关的 `device.hello` 会话。
+
+### 4.4 端侧声纹识别（On-Device Voiceprint）方案
 
 | 环节 | 推荐实现方案 |
 | :--- | :--- |
@@ -186,17 +200,17 @@ flowchart LR
 | **存储与比对** | 注册时录入 3~5 句样本取均值归一化，存入开启 **NVS 加密** 的本地分区（192 维 float32 仅 768 B/人）；推理时通过余弦相似度匹配 |
 | **端云分级策略** | `score >= 0.85` 端侧直接采信；`0.65 <= score < 0.85` 标记 `uncertain` 交网关 3D-Speaker 复核；`score < 0.65` 在严格模式下本地拒绝或降权为 `guest` |
 
-### 4.4 其他端侧感知扩展
+### 4.5 其他端侧感知扩展
 
 * **离线命令词（MultiNet）**：结合端侧声纹，实现断网状态下“仅主人可触发的本地硬件控制”。
 * **声源定位（DOA）**：配合双麦阵列（如 `ESP32-S31-Korvo-1`）输出方位角，用于机器人转向或空间上下文。
 * **声音事件检测（SED）**：轻量分类模型监测哭声、敲门、报警声等异常事件，主动触发 Push 通知 Agent。
 
-### 4.5 ESP32-S31 双核 SMP 调度与内存/分区规划
+### 4.6 ESP32-S31 双核 SMP 调度与内存/分区规划
 
 #### 双核任务分配建议
 * **HP Core 0（实时音频域）**：`AudioInputTask`、`AfeAudioEngine`（AEC/NS/VAD/WakeNet）、`OpusCodecTask`、`AudioOutputTask`。
-* **HP Core 1（推理与系统域）**：`VoiceprintTask`（低优先级异步推理）、`SedTask`、`Application` 状态机、Wi-Fi/lwIP/WebSocket/MQTT 网络任务、UI 渲染与相机采集任务。
+* **HP Core 1（推理与系统域）**：`VoiceprintTask`（低优先级异步推理）、`SedTask`、`Application` 状态机、`NetWorkerTask`（Wi-Fi 扫描/重连与 NVS 写入，片内 DRAM 栈）、`DnsPortalTask`（仅配网期间运行）、Wi-Fi/lwIP/WebSocket/MQTT 网络任务、UI 渲染与相机采集任务。
 
 #### 内存分配约束
 * **片内 DRAM（`MALLOC_CAP_DMA` / `INTERNAL`）**：I2S DMA 缓冲区、AFE 实时工作帧、中断回调数据（`IRAM_ATTR` / `DRAM_ATTR`）、FreeRTOS 任务 TCB 及需执行 Flash 写入的任务栈。
@@ -309,6 +323,25 @@ model,            data, spiffs,  ,         4M,     readonly
 | **Member（家庭/团队成员）** | 匹配已注册成员且通过阈值（如端云默认 `>= 0.6`） | 个人记忆、专属人设/音色、常规问答、日常家电/查询类 MCP 工具（禁止高危控制与敏感操作） |
 | **Guest（访客/未识别）** | 未匹配或低于阈值 | 仅限公共问答与无副作用查询；高危工具自动拒绝或要求二次验证 |
 
+### 6.4 EZ Assistant 桌面端 `Device Protocol 1.0` 桥接模式
+
+除了通过 `proto/agent/v1` gRPC 接入自研或本地 `agent/ez-bridge` 外，网关还内置了面向局域网 **EZ Assistant 桌面端（`Runtime Host`）** 的 `Device Protocol 1.0` 虚拟终端桥接模式（`EZDeviceBridge`，通过 `RoutingAgentAdapter` 与 `GRPCAgentAdapter` 共同实现统一 `biz.AgentAdapter`）：
+
+1. **三层架构不变与职责分离**：
+   * 网关继续负责 ESP32-S31 终端的 MAC 白名单认证、Opus 音频流、端云声纹复核、DeepSeek ASR/TTS 以及 Device MCP Server（`http://<gateway-ip>:8088/mcp`）。
+   * 网关以 **纯文字能力**（`input_text=true, output_text=true, display_status=true, display_transcript=true`，音频字段均为 `false`，`output_preference="text"`）接入桌面端 `_ez-assistant._tcp.local.`；即使桌面端未配置语音（ASR/TTS）Provider，也可直接将语音转写后的文字提交至桌面端主控会话并流式取回 `text_output` 交由网关 TTS 播报。
+2. **安全配对、证书钉扎与长连接保活**：
+   * **mDNS 发现与动态端口追踪**：浏览 `_ez-assistant._tcp.local.`（TXT 携带 `installation_id`、`certificate_fingerprint`、`path="/device"`、`pairing_available`、`pairing_modes=direct_confirm,spake2`），并支持按 `installation_id` 自动追踪桌面端重启后的动态 WSS 端口。
+   * **TLS 证书钉扎**：在 `tls.Config.VerifyConnection` 阶段于 HTTP Upgrade 前执行常量时间（`subtle.ConstantTimeCompare`）叶证书 DER SHA-256 指纹校验（64 位小写十六进制）。
+   * **免码一键确认（`direct_confirm`）与 SPAKE2 回退**：
+     * **`direct_confirm`（默认首选）**：网关在 `pairing_hello` 上报长期 Ed25519 公钥，桌面端向用户展示来源 IP 与公钥指纹（`XXXX-XXXX`）并提供一键「确认配对 / 拒绝」；确认后桌面端下发 `pairing_direct_challenge`，网关先在 `gateway_settings` 原子写入 `pending` 身份再签名发送 `pairing_direct_commit`，收到 `pairing_complete` 后激活为 `active`。
+     * **`spake2`（兼容回退）**：当 `pairing_mode="spake2"` 或旧版 Host 拒绝 `direct_confirm` 时，在 `auto` 模式下自动回退至 6 位一次性数字配对码完成 SPAKE2 P-256 双向确认与绑定。
+     * **后续长连接认证**：均使用 v1.0 `auth_challenge` + `hello` 签名认证并保持 15 秒应用层 `ping` / `pong` 心跳。
+3. **路由模式与自动配置反向 MCP 控制**：
+   * 支持 Web 控制台热切换 `auto`（默认：EZ Assistant 在线时优先走 `ez_device`，离线自动回退 `grpc` / `ez-bridge`）、`ez_device` 与 `grpc` 三种模式。
+   * **网关 MCP 自动下发与对端 IP 钉扎**：网关在已认证 `DeviceHello.mcp_servers` 中声明自身的 Streamable HTTP MCP 服务（`id="esp-pika-gateway"`、HTTP 端口、`path="/mcp"`、`headers={"X-Agent-ID": "ez-assistant", "X-Speaker-Role": "owner"}`）；桌面端严格按当前 WebSocket 对端 IP 拼装 `http://<peer-ip>:<port>/mcp` 并注册为受管来源 `McpServerSource::Device(device_id)`（支持上线/IP 变更自动重连、断连标记 `source_enabled=false`、撤销配对时彻底清理）。
+   * **权限与 ACL 护栏**：桌面端保持 Controller 工具严格隔离（不自动放行设备 MCP 工具权限，由用户在 `设置 → 权限 → Controller` 显式授权）；网关侧通过 SQLite 默认种子规则 `default-ez-assistant-owner`（`agent_id="ez-assistant"`、`tool_pattern="device.*"`、`min_speaker_role=1`）开放面向已授权桌面主控的 `device.*` 与 `device.fleet_list` MCP 能力。
+
 ---
 
 ## 7. 硬件外设与传感器能力化（Device-as-MCP-Capability）
@@ -320,6 +353,11 @@ model,            data, spiffs,  ,         4M,     readonly
 | **Pull（按需拉取/控制）** | **MCP Tools** | 摄像头拍照（`camera.capture`）、设置音量/灯光/GPIO/舵机、切换 LCD 表情、声纹录入/删除 |
 | **Context（状态快照）** | **MCP Resources** + 上下文注入 | 温湿度、光照、电量、网络状态（由设备周期上报到网关 Device Shadow，Agent 零延迟读取） |
 | **Push（主动触发）** | **Event Bus → Agent 回调** | PIR 人体红外、毫米波雷达、门磁、按键、异常声音事件（SED）触发 Agent 主动拍照/播报/告警 |
+
+### 6.5 EZ Assistant Desktop 协同（控制台受控代理与 WSS 语音中继）
+
+1. **受控控制台代理（`DeviceHello.console`）**：已配对网关在通过 `Device Protocol 1.0` 建立 WSS 长连接时，随 `hello` 声明网关管理 HTTP 端口、`api_prefix`（`/api/v1`）与可选 `ui_path`（`/ui/`）。`ez-assistant` Host 将控制台目标严格固定到认证连接的真实 `peer_ip`，通过受鉴权的 `/devices/{device_id}/console/{*path}` 对 Desktop 暴露原生控制面板（拓扑/指令、MAC 白名单、ACL、声纹与语音测试），并明确屏蔽 `/api/v1/settings/deepseek` 及非本地转发。
+2. **优先语音中继（`DeviceHello.speech_relay`）**：网关声明 `speech_relay: true` 后，`ez-assistant` Host 在 `hello_ack` 及后续配置变更时通过 `speech_status_changed` 同步 `[speech.asr]`/`[speech.tts]` 就绪状态；当对应能力为 `ready` 时，网关优先将 ESP32-S31 上行语音（转 16kHz Mono PCM16，经 binary kind=3 上传）与下行文本播报（经 `speech_tts_request` / binary kind=4 取回 PCM16 再转 24kHz Opus 单帧）委托给 Desktop Host 执行，Host 离线或未配置时自动无缝回退到网关本地语音 Provider。
 
 ### 7.1 摄像头视觉数据流最佳实践
 
