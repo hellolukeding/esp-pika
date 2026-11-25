@@ -484,6 +484,47 @@ bool NetClient::Init(const NetClientConfig& cfg) {
 #endif
 }
 
+#ifdef ESP_PLATFORM
+void NetClient::EnsureMdnsInitialized() {
+    std::lock_guard<std::mutex> lock(state_mu_);
+    if (mdns_started_) {
+        return;
+    }
+    esp_err_t mdns_err = mdns_init();
+    if (mdns_err == ESP_OK || mdns_err == ESP_ERR_INVALID_STATE) {
+        std::string suffix_lower = "mosaico";
+        std::string suffix_upper = "Mosaico";
+        std::string hex;
+        for (char ch : device_mac_) {
+            if (std::isxdigit(static_cast<unsigned char>(ch))) {
+                hex.push_back(ch);
+            }
+        }
+        if (hex.size() >= 4) {
+            std::string tail = hex.substr(hex.size() - 4);
+            std::string tail_l = tail;
+            std::string tail_u = tail;
+            for (char& c : tail_l) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            for (char& c : tail_u) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            suffix_lower = "mosaico-" + tail_l;
+            suffix_upper = "Mosaico-" + tail_u;
+        }
+        mdns_hostname_set(suffix_lower.c_str());
+        mdns_instance_name_set(suffix_upper.c_str());
+        mdns_started_ = true;
+    } else {
+        ESP_LOGW(kTag, "mdns_init failed (%s); fallback gateway remains available",
+                 esp_err_to_name(mdns_err));
+    }
+}
+#endif
+
+void NetClient::EnsureMdnsStarted() {
+#ifdef ESP_PLATFORM
+    EnsureMdnsInitialized();
+#endif
+}
+
 bool NetClient::WaitForWifi(uint32_t timeout_ms) {
 #ifdef ESP_PLATFORM
     if (!wifi_started_ || wifi_events_ == nullptr) {
@@ -496,13 +537,7 @@ bool NetClient::WaitForWifi(uint32_t timeout_ms) {
     if (!wifi_connected_.load(std::memory_order_acquire)) {
         return false;
     }
-    if (!mdns_started_) {
-        if (mdns_init() == ESP_OK) {
-            mdns_started_ = true;
-        } else {
-            ESP_LOGW(kTag, "mdns_init failed; fallback gateway remains available");
-        }
-    }
+    EnsureMdnsInitialized();
     return true;
 #else
     (void)timeout_ms;
@@ -558,6 +593,11 @@ bool NetClient::SetGatewayOverride(const std::string& host, uint16_t port) {
     cmd.port = (port == 0) ? 8080 : port;
     EnqueueWorkerCmd(std::move(cmd), true);
     return true;
+}
+
+WifiGatewayOverride NetClient::GetGatewayOverride() const {
+    std::lock_guard<std::mutex> lock(state_mu_);
+    return wifi_store_.GatewayOverride();
 }
 
 bool NetClient::DiscoverGateway(GatewayEndpoint* out_endpoint) {
@@ -1194,13 +1234,7 @@ bool NetClient::ConnectSingleNetwork(const std::string& ssid,
     connect_attempt_active_.store(false, std::memory_order_release);
 
     if (connected) {
-        if (!mdns_started_) {
-            if (mdns_init() == ESP_OK) {
-                mdns_started_ = true;
-            } else {
-                ESP_LOGW(kTag, "mdns_init failed; fallback gateway remains available");
-            }
-        }
+        EnsureMdnsInitialized();
         int rssi = -55;
         wifi_ap_record_t ap_info = {};
         if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {

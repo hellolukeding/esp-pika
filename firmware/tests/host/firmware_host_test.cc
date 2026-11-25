@@ -12,6 +12,9 @@
 #include "audio_engine.h"
 #include "board.h"
 #include "chime_pcm.h"
+#include "ed25519_lite.h"
+#include "ez_device_client.h"
+#include "ez_protocol.h"
 #include "fbank_extractor.h"
 #include "gateway_protocol.h"
 #include "local_executor.h"
@@ -736,6 +739,267 @@ void TestMosaicoWifiUiAndKeyboard() {
     assert(sm.OnPortalStopped(true) == DeviceState::kDiscovering);
 }
 
+std::vector<uint8_t> DecodeHexBytes(const char* hex) {
+    const size_t len = std::strlen(hex);
+    assert(len % 2 == 0);
+    std::vector<uint8_t> out(len / 2, 0);
+    auto nib = [](char c) -> uint8_t {
+        if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
+        if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(10 + c - 'a');
+        if (c >= 'A' && c <= 'F') return static_cast<uint8_t>(10 + c - 'A');
+        assert(false);
+        return 0;
+    };
+    for (size_t i = 0; i < out.size(); ++i) {
+        out[i] = static_cast<uint8_t>((nib(hex[i * 2]) << 4) | nib(hex[i * 2 + 1]));
+    }
+    return out;
+}
+
+std::string EncodeHexBytes(const uint8_t* data, size_t len) {
+    static const char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(len * 2);
+    for (size_t i = 0; i < len; ++i) {
+        out.push_back(kHex[(data[i] >> 4) & 0x0f]);
+        out.push_back(kHex[data[i] & 0x0f]);
+    }
+    return out;
+}
+
+void TestEd25519Rfc8032VectorsAndEzCryptoFixture() {
+    struct Vector {
+        const char* seed_hex;
+        const char* msg_hex;
+        const char* expected_pub_hex;
+        const char* expected_sig_hex;
+    };
+    const Vector vectors[] = {
+        {
+            "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+            "",
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+            "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155"
+            "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+        },
+        {
+            "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+            "72",
+            "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+            "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
+            "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00",
+        },
+        {
+            "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+            "af82",
+            "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+            "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac"
+            "18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a",
+        },
+    };
+
+    for (const auto& v : vectors) {
+        const auto seed = DecodeHexBytes(v.seed_hex);
+        const auto msg = DecodeHexBytes(v.msg_hex);
+        assert(seed.size() == 32);
+        uint8_t pub[32] = {};
+        uint8_t sig[64] = {};
+        ez_ed25519_public_key(seed.data(), pub);
+        assert(EncodeHexBytes(pub, sizeof(pub)) == v.expected_pub_hex);
+        ez_ed25519_sign(seed.data(), pub, msg.empty() ? nullptr : msg.data(), msg.size(), sig);
+        assert(EncodeHexBytes(sig, sizeof(sig)) == v.expected_sig_hex);
+    }
+
+    // Cross-verified against ez-assistant docs/resources/device-protocol-v1/fixtures/crypto-v1.json
+    EzPairingIdentity fix_id;
+    fix_id.has_seed = true;
+    for (uint8_t i = 0; i < 32; ++i) {
+        fix_id.ed25519_seed[i] = i;
+    }
+    ez_ed25519_public_key(fix_id.ed25519_seed, fix_id.ed25519_pub);
+    assert(fix_id.PublicKeyBase64Url() == "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg");
+    const std::string fp = fix_id.PublicKeyFingerprint();
+    assert(fp.size() == 9 && fp[4] == '-');
+
+    EzCapabilities fix_caps;
+    fix_caps.input_text = true;
+    fix_caps.input_pcm16_16k_mono = false;
+    fix_caps.output_text = true;
+    fix_caps.output_pcm16_16k_mono = false;
+    fix_caps.playback_cancel = false;
+    fix_caps.display_status = true;
+    fix_caps.display_transcript = true;
+
+    const std::string auth_sig = EzComputeAuthSignature(
+        fix_id.ed25519_seed, fix_id.ed25519_pub, "connection-fixture", "host-auth-nonce",
+        "device-fixture", "device-auth-nonce", fix_caps, EzOutputPreference::kText);
+    assert(auth_sig ==
+           "0Yn3d21SvbS0GEj9BLydIypy4JUotUiburl5jojJTUo9JCXCJ7S9k7VKWM-ZnRTnDBxf7whvbntuUyDraAFsDg");
+
+    const std::string cert_fp(64, 'a');
+    const std::string commit_sig_1 = EzComputePairingCommitSignature(
+        fix_id.ed25519_seed, fix_id.ed25519_pub, "req-1", "0123456789abcdef0123456789abcdef",
+        cert_fp, "dev-n", "host-n", fix_caps, "device-1");
+    const std::string commit_sig_2 = EzComputePairingCommitSignature(
+        fix_id.ed25519_seed, fix_id.ed25519_pub, "req-1", "0123456789abcdef0123456789abcdef",
+        cert_fp, "dev-n", "host-n", fix_caps, "device-2");
+    assert(commit_sig_1.size() == 86 && commit_sig_2.size() == 86);
+    assert(commit_sig_1 != commit_sig_2);
+}
+
+void TestEzProtocolAndUiPairingFlow() {
+    EzPairingIdentity orig;
+    orig.has_seed = true;
+    for (size_t i = 0; i < 32; ++i) {
+        orig.ed25519_seed[i] = static_cast<uint8_t>(i + 1);
+    }
+    ez_ed25519_public_key(orig.ed25519_seed, orig.ed25519_pub);
+    orig.paired = true;
+    orig.installation_id = "0123456789abcdef0123456789abcdef";
+    orig.cert_fingerprint = std::string(64, 'b');
+    orig.device_id = "device-abc";
+    orig.host_address = "192.168.110.50";
+    orig.host_port = 51234;
+    orig.host_path = "/device";
+    orig.display_name = "Mosaico-5BF0";
+
+    std::vector<uint8_t> blob;
+    assert(orig.Serialize(&blob));
+
+    EzPairingIdentity decoded;
+    assert(decoded.Deserialize(blob.data(), blob.size()));
+    assert(decoded.has_seed && decoded.paired);
+    assert(std::memcmp(decoded.ed25519_seed, orig.ed25519_seed, 32) == 0);
+    assert(std::memcmp(decoded.ed25519_pub, orig.ed25519_pub, 32) == 0);
+    assert(decoded.device_id == "device-abc");
+    assert(decoded.host_address == "192.168.110.50");
+    assert(decoded.host_port == 51234);
+
+    // Corrupted CRC must fail.
+    blob[blob.size() - 1] ^= 0x55;
+    assert(!decoded.Deserialize(blob.data(), blob.size()));
+
+    // ClearPairing preserves key seed/pub while wiping pairing fields.
+    orig.ClearPairing();
+    assert(orig.has_seed && !orig.paired);
+    assert(orig.device_id.empty() && orig.host_address.empty() && orig.host_port == 0);
+
+    // PCM16 20ms frame encode / decode
+    uint8_t pcm640[640] = {};
+    for (size_t i = 0; i < sizeof(pcm640); ++i) {
+        pcm640[i] = static_cast<uint8_t>(i & 0xffu);
+    }
+    uint8_t uplink[656] = {};
+    assert(EzEncodeUplinkPcmFrame(7, 42, pcm640, uplink));
+    assert(uplink[0] == 1 && uplink[1] == 1);
+    assert(uplink[7] == 7 && uplink[11] == 42);
+    assert(uplink[12] == 0x02 && uplink[13] == 0x80);
+
+    // Flip kind to downlink=2 and decode.
+    uplink[1] = 2;
+    uint32_t sid = 0;
+    uint32_t seq = 0;
+    const uint8_t* out_pcm = nullptr;
+    size_t out_len = 0;
+    assert(EzDecodeDownlinkPcmFrame(uplink, sizeof(uplink), &sid, &seq, &out_pcm, &out_len));
+    assert(sid == 7 && seq == 42 && out_len == 640);
+    assert(std::memcmp(out_pcm, pcm640, 640) == 0);
+    assert(!EzDecodeDownlinkPcmFrame(uplink, 600, &sid, &seq, &out_pcm, &out_len));
+
+    // Inbound JSON parsing + UTF-8 \uXXXX decoding
+    EzInboundMessage msg;
+    assert(EzParseInboundMessage(
+        "{\"protocol_major\":1,\"protocol_minor\":0,\"message_id\":\"m1\",\"type\":\"transcript\","
+        "\"payload\":{\"client_input_id\":\"in1\",\"text\":\"\\u4f60\\u597d\"}}",
+        &msg));
+    assert(msg.type == EzInboundType::kTranscript);
+    assert(msg.text == "\xE4\xBD\xA0\xE5\xA5\xBD");
+
+    assert(EzParseInboundMessage(
+        "{\"protocol_major\":1,\"protocol_minor\":0,\"message_id\":\"m2\","
+        "\"type\":\"pairing_direct_challenge\","
+        "\"payload\":{\"pairing_request_id\":\"pr1\",\"host_nonce\":\"hn1\",\"device_id\":\"dev-9\"}}",
+        &msg));
+    assert(msg.type == EzInboundType::kPairingDirectChallenge);
+    assert(msg.pairing_request_id == "pr1" && msg.host_nonce == "hn1" && msg.device_id == "dev-9");
+
+    assert(EzParseInboundMessage(
+        "{\"protocol_major\":1,\"protocol_minor\":0,\"message_id\":\"m3\",\"type\":\"hello_ack\","
+        "\"payload\":{\"device_id\":\"dev-9\",\"connection_id\":\"c1\","
+        "\"output_preference\":\"text\","
+        "\"capabilities\":{\"input_text\":true,\"input_pcm16_16k_mono\":true,"
+        "\"output_text\":true,\"output_pcm16_16k_mono\":true,\"playback_cancel\":true,"
+        "\"display_status\":true,\"display_transcript\":true}}}",
+        &msg));
+    assert(msg.type == EzInboundType::kHelloAck);
+    assert(msg.capabilities.input_pcm16_16k_mono && msg.capabilities.output_pcm16_16k_mono);
+    assert(msg.output_preference == EzOutputPreference::kText);
+
+    assert(EzParseInboundMessage(
+        "{\"protocol_major\":1,\"protocol_minor\":0,\"message_id\":\"m4\",\"type\":\"ping\","
+        "\"payload\":{\"nonce\":\"pn-1\",\"sent_at_ms\":1234567890}}",
+        &msg));
+    assert(msg.type == EzInboundType::kPing && msg.ping_nonce == "pn-1" &&
+           msg.ping_sent_at_ms == 1234567890LL);
+
+    // Connect trigger JSON parsing
+    EzConnectTrigger trig;
+    const std::string trig_json =
+        std::string("{\"host\":\"192.168.110.9\",\"port\":50123,\"path\":\"/device\",") +
+        "\"installation_id\":\"0123456789ABCDEF0123456789abcdef\"," +
+        "\"certificate_fingerprint\":\"" + std::string(64, 'C') + "\"}";
+    assert(EzParseConnectTriggerJson(trig_json, &trig));
+    assert(trig.host == "192.168.110.9" && trig.port == 50123 && trig.path == "/device");
+    assert(trig.installation_id == "0123456789abcdef0123456789abcdef");
+    assert(trig.certificate_fingerprint == std::string(64, 'c'));
+
+    // Host-side AudioEngine 20ms PCM16 codec switch & downlink queue test
+    auto mosaico_board = CreateMosaicoBoard();
+    assert(mosaico_board && mosaico_board->Init());
+    AudioEngine eng;
+    AudioEngineConfig ecfg;
+    ecfg.transport_codec = AudioTransportCodec::kPcm16_20ms;
+    assert(eng.Init(mosaico_board->Audio(), ecfg));
+    assert(eng.TransportCodec() == AudioTransportCodec::kPcm16_20ms);
+    assert(eng.EnqueueDownlinkPcm16(pcm640, sizeof(pcm640)));
+    assert(eng.DownlinkQueueSize() == 1);
+    eng.ClearDownlinkQueue();
+    assert(eng.DownlinkQueueSize() == 0);
+
+    // MosaicoUi direct-mode PAIR READY render & drawer UNPAIR callback test
+    MosaicoUi ui;
+    bool unpair_called = false;
+    UiCallbacks uicbs;
+    uicbs.on_ez_unpair = [&]() { unpair_called = true; };
+    assert(ui.Init(uicbs));
+
+    UiSnapshot snap;
+    snap.mac = "30:ed:a0:f4:5b:f0";
+    snap.wifi_connected = true;
+    snap.wifi_mode = WifiUiMode::kConnected;
+    snap.ez_direct_mode = true;
+    snap.ez_paired = false;
+    snap.ez_key_fp = "A1B2-C3D4";
+    ui.RenderPreviewExpression(AvatarEmotion::kIdle, snap, "");
+    assert(ui.Framebuffer()[0] == 0x0000);
+
+    snap.ez_paired = true;
+    snap.gateway_connected = true;
+    std::vector<UiRect> dirty;
+    ui.OnTouch({true, 240, 20, 1}, 100, &snap);
+    ui.OnTouch({true, 240, 95, 1}, 130, &snap);
+    ui.OnTouch({false, 240, 95, 0}, 150, &snap);
+    assert(ui.IsDrawerOpen());
+    for (int i = 0; i < 15; ++i) {
+        ui.StepAndRender(0.05f, snap, &dirty);
+    }
+    ui.RenderPreviewDrawer(snap);
+    ui.OnTouch({true, 270, 170, 1}, 1000, &snap);
+    ui.OnTouch({false, 270, 170, 0}, 1020, &snap);
+    assert(unpair_called);
+    assert(!snap.ez_paired && !ui.IsDrawerOpen());
+}
+
 } // namespace
 
 int main() {
@@ -751,6 +1015,8 @@ int main() {
     TestWifiStoreAndSelection();
     TestWifiPortalProtocol();
     TestMosaicoWifiUiAndKeyboard();
+    TestEd25519Rfc8032VectorsAndEzCryptoFixture();
+    TestEzProtocolAndUiPairingFlow();
     std::printf("ALL FIRMWARE HOST TESTS PASSED\n");
     return 0;
 }

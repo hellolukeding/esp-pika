@@ -10,8 +10,10 @@ if(APPLE AND NOT DEFINED CMAKE_OSX_SYSROOT)
         set(CMAKE_OSX_SYSROOT "${MACOS_SDK_PATH}" CACHE PATH "macOS SDK path")
     endif()
 endif()
-project(esp_pika_firmware_host_tests LANGUAGES CXX)
+project(esp_pika_firmware_host_tests LANGUAGES C CXX)
 
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -24,8 +26,11 @@ add_executable(firmware_host_test
     "${FIRMWARE_DIR}/components/board/src/board_s31_korvo.cc"
     "${FIRMWARE_DIR}/components/board/src/board_s31_mosaico.cc"
     "${FIRMWARE_DIR}/components/board/src/chime_pcm.cc"
+    "${FIRMWARE_DIR}/components/net_client/src/ed25519_lite.c"
     "${FIRMWARE_DIR}/components/net_client/src/mac_identity.cc"
     "${FIRMWARE_DIR}/components/net_client/src/gateway_protocol.cc"
+    "${FIRMWARE_DIR}/components/net_client/src/ez_protocol.cc"
+    "${FIRMWARE_DIR}/components/net_client/src/ez_device_client.cc"
     "${FIRMWARE_DIR}/components/net_client/src/wifi_store.cc"
     "${FIRMWARE_DIR}/components/net_client/src/wifi_portal.cc"
     "${FIRMWARE_DIR}/components/net_client/src/net_client.cc"
@@ -55,14 +60,15 @@ target_include_directories(firmware_host_test PRIVATE
 
 if(APPLE AND EXISTS "${CMAKE_OSX_SYSROOT}/usr/include/c++/v1")
     target_compile_options(firmware_host_test PRIVATE
-        -nostdinc++
-        -isystem "${CMAKE_OSX_SYSROOT}/usr/include/c++/v1"
+        $<$<COMPILE_LANGUAGE:CXX>:-nostdinc++>
+        $<$<COMPILE_LANGUAGE:CXX>:-isystem>
+        $<$<COMPILE_LANGUAGE:CXX>:${CMAKE_OSX_SYSROOT}/usr/include/c++/v1>
     )
 endif()
 
 target_compile_options(firmware_host_test PRIVATE
-    -fno-exceptions
-    -fno-rtti
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>
     -Wall
     -Wextra
     -Werror

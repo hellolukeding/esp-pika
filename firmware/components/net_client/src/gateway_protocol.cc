@@ -13,6 +13,47 @@ void SkipWhitespace(const std::string& s, size_t* pos) {
     }
 }
 
+void AppendUtf8Codepoint(uint32_t cp, std::string* out) {
+    if (cp <= 0x7Fu) {
+        out->push_back(static_cast<char>(cp));
+    } else if (cp <= 0x7FFu) {
+        out->push_back(static_cast<char>(0xC0u | (cp >> 6)));
+        out->push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    } else if (cp <= 0xFFFFu) {
+        out->push_back(static_cast<char>(0xE0u | (cp >> 12)));
+        out->push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+        out->push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    } else if (cp <= 0x10FFFFu) {
+        out->push_back(static_cast<char>(0xF0u | (cp >> 18)));
+        out->push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
+        out->push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+        out->push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    }
+}
+
+bool ParseHex4(const std::string& s, size_t* pos, uint32_t* out) {
+    if (*pos + 4 > s.size()) {
+        return false;
+    }
+    uint32_t v = 0;
+    for (int i = 0; i < 4; ++i) {
+        char ch = s[*pos + static_cast<size_t>(i)];
+        v <<= 4;
+        if (ch >= '0' && ch <= '9') {
+            v |= static_cast<uint32_t>(ch - '0');
+        } else if (ch >= 'a' && ch <= 'f') {
+            v |= static_cast<uint32_t>(10 + (ch - 'a'));
+        } else if (ch >= 'A' && ch <= 'F') {
+            v |= static_cast<uint32_t>(10 + (ch - 'A'));
+        } else {
+            return false;
+        }
+    }
+    *pos += 4;
+    *out = v;
+    return true;
+}
+
 bool ParseJsonStringAt(const std::string& s, size_t* pos, std::string* out) {
     if (*pos >= s.size() || s[*pos] != '"') {
         return false;
@@ -39,6 +80,23 @@ bool ParseJsonStringAt(const std::string& s, size_t* pos, std::string* out) {
             case 'n': res.push_back('\n'); break;
             case 'r': res.push_back('\r'); break;
             case 't': res.push_back('\t'); break;
+            case 'u': {
+                uint32_t cp = 0;
+                if (!ParseHex4(s, pos, &cp)) {
+                    return false;
+                }
+                if (cp >= 0xD800u && cp <= 0xDBFFu && *pos + 2 <= s.size() &&
+                    s[*pos] == '\\' && s[*pos + 1] == 'u') {
+                    size_t next_pos = *pos + 2;
+                    uint32_t low = 0;
+                    if (ParseHex4(s, &next_pos, &low) && low >= 0xDC00u && low <= 0xDFFFu) {
+                        *pos = next_pos;
+                        cp = 0x10000u + (((cp - 0xD800u) << 10) | (low - 0xDC00u));
+                    }
+                }
+                AppendUtf8Codepoint(cp, &res);
+                break;
+            }
             default: res.push_back(esc); break;
             }
         } else {

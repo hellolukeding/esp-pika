@@ -50,6 +50,7 @@ struct HitRect {
     }
 };
 
+constexpr HitRect kDrawerUnpairBtn{228, 144, 90, 50};
 constexpr HitRect kDrawerWifiBtn{326, 144, 104, 50};
 constexpr HitRect kWifiScanBtn{52, 128, 116, 36};
 constexpr HitRect kWifiHotspotBtn{178, 128, 140, 36};
@@ -160,6 +161,34 @@ std::string TruncAscii(const std::string& raw, size_t max_chars) {
         clean = clean.substr(0, max_chars - 2) + "..";
     }
     return clean;
+}
+
+std::string ResolveTopRightPill(const UiSnapshot& state,
+                                AvatarEmotion active_emotion,
+                                bool* is_alert_pill = nullptr) {
+    if (is_alert_pill != nullptr) {
+        *is_alert_pill = false;
+    }
+    if (!state.status_tag.empty()) {
+        return state.status_tag;
+    }
+    if (state.wifi_mode == WifiUiMode::kPortal) {
+        if (is_alert_pill != nullptr) {
+            *is_alert_pill = true;
+        }
+        return "WIFI SETUP";
+    }
+    if (state.ez_direct_mode && state.wifi_connected && !state.ez_paired &&
+        active_emotion == AvatarEmotion::kIdle) {
+        if (is_alert_pill != nullptr) {
+            *is_alert_pill = true;
+        }
+        return "PAIR READY";
+    }
+    if (active_emotion == AvatarEmotion::kIdle && !state.session_tag.empty()) {
+        return state.session_tag;
+    }
+    return std::string(AvatarEmotionLabel(active_emotion));
 }
 
 void DrawSignalBars(uint16_t* fb, int fb_w, int fb_h, int x, int y, int rssi, uint16_t active_col, uint16_t muted_col) {
@@ -443,6 +472,16 @@ void MosaicoUi::OnTouch(const TouchPoint& tp, int64_t now_ms, UiSnapshot* mutabl
             if (dy < -45 || (was_tap && cur_y_ > 426)) {
                 drawer_open_ = false;
                 force_full_refresh_ = true;
+            } else if (was_tap && mutable_state != nullptr && mutable_state->ez_direct_mode &&
+                       mutable_state->ez_paired && kDrawerUnpairBtn.Contains(cur_x_, cur_y_)) {
+                if (callbacks_.on_ez_unpair) {
+                    callbacks_.on_ez_unpair();
+                }
+                mutable_state->ez_paired = false;
+                mutable_state->gateway_connected = false;
+                drawer_open_ = false;
+                force_full_refresh_ = true;
+                ShowMessage("curious", "UNPAIRED // READY", 3.0f);
             } else if (was_tap && kDrawerWifiBtn.Contains(cur_x_, cur_y_)) {
                 OpenWifiMenu();
             } else if (was_tap && cur_y_ >= 344 && cur_y_ <= 416) {
@@ -576,24 +615,14 @@ void MosaicoUi::RenderTopHud(const UiSnapshot& state, AvatarEmotion active_emoti
                             state.battery_valid ? state.battery_percent : 100, charging,
                             mono_col, bat_col);
 
-    std::string right_text = state.status_tag;
-    bool portal_pill = false;
-    if (right_text.empty()) {
-        if (state.wifi_mode == WifiUiMode::kPortal) {
-            right_text = "WIFI SETUP";
-            portal_pill = true;
-        } else if (active_emotion == AvatarEmotion::kIdle && !state.session_tag.empty()) {
-            right_text = state.session_tag;
-        } else {
-            right_text = AvatarEmotionLabel(active_emotion);
-        }
-    }
+    bool alert_pill = false;
+    const std::string right_text = ResolveTopRightPill(state, active_emotion, &alert_pill);
     const std::string pill = "[ " + right_text + " ]";
     const int scale = 2;
     const int text_w = static_cast<int>(pill.size()) * (6 * scale) - scale;
     const int rx = std::max(210, 442 - text_w);
     uint16_t pill_col = MakeRgb565(146, 152, 168);
-    if (portal_pill || active_emotion == AvatarEmotion::kSurprised) {
+    if (alert_pill || active_emotion == AvatarEmotion::kSurprised) {
         pill_col = kColorAccentAmber;
     } else if (active_emotion == AvatarEmotion::kListening) {
         pill_col = kColorAccentCyan;
@@ -625,6 +654,14 @@ void MosaicoUi::RenderBottomCaption(const UiSnapshot& state, float audio_energy)
                                          portal_line, 1, kColorAccentAmber, 235);
                 ui_gfx::DrawCenteredText(framebuffer_, kWidth, kHeight, 240, 444,
                                          "TAP HERE TO CONFIG WIFI", 1, kColorHudMuted, 210);
+            } else if (state.ez_direct_mode && state.wifi_connected && !state.ez_paired) {
+                const std::string fp =
+                    state.ez_key_fp.empty() ? "----" : TruncAscii(state.ez_key_fp, 12);
+                const std::string pair_line = "PAIR READY // FP: " + fp;
+                ui_gfx::DrawCenteredText(framebuffer_, kWidth, kHeight, 240, 424,
+                                         pair_line, 1, kColorAccentCyan, 235);
+                ui_gfx::DrawCenteredText(framebuffer_, kWidth, kHeight, 240, 444,
+                                         "OPEN EZ ASSISTANT -> CONNECT", 1, kColorHudMuted, 210);
             } else {
                 ui_gfx::DrawCenteredText(framebuffer_, kWidth, kHeight, 240, 436,
                                          "TAP TO TALK // MOSAICO", 2, MakeRgb565(92, 98, 114), 210);
@@ -708,11 +745,35 @@ void MosaicoUi::RenderDrawerOverlay(const UiSnapshot& state, int height_px) {
     ui_gfx::DrawText(framebuffer_, kWidth, kHeight, 54, 126, TruncAscii(net_line, 40), 1,
                      state.wifi_connected ? kColorAccentMint : kColorAccentAmber, 230);
 
-    char line4[64] = {};
-    std::snprintf(line4, sizeof(line4), "GW=%s  MAC=%s", state.gateway_connected ? "OK" : "OFF",
-                  state.mac.c_str());
-    ui_gfx::DrawText(framebuffer_, kWidth, kHeight, 54, 156, TruncAscii(line4, 42), 1, kColorHudMuted,
-                     225);
+    if (state.ez_direct_mode) {
+        const std::string fp = state.ez_key_fp.empty() ? "----" : TruncAscii(state.ez_key_fp, 10);
+        if (state.ez_paired) {
+            const std::string ez_line =
+                std::string("EZ:") + (state.gateway_connected ? "OK" : "WAIT") + " FP:" + fp;
+            ui_gfx::DrawText(framebuffer_, kWidth, kHeight, 54, 156, TruncAscii(ez_line, 26), 1,
+                             state.gateway_connected ? kColorAccentMint : kColorHudMuted, 225);
+
+            ui_gfx::FillRoundedRect(framebuffer_, kWidth, kHeight, kDrawerUnpairBtn.x,
+                                    kDrawerUnpairBtn.y, kDrawerUnpairBtn.w, kDrawerUnpairBtn.h, 12,
+                                    MakeRgb565(46, 20, 26), 255);
+            ui_gfx::StrokeRoundedRect(framebuffer_, kWidth, kHeight, kDrawerUnpairBtn.x,
+                                      kDrawerUnpairBtn.y, kDrawerUnpairBtn.w, kDrawerUnpairBtn.h,
+                                      12, kColorAccentDanger, 255);
+            ui_gfx::DrawCenteredText(framebuffer_, kWidth, kHeight,
+                                     kDrawerUnpairBtn.x + kDrawerUnpairBtn.w / 2,
+                                     kDrawerUnpairBtn.y + 18, "UNPAIR", 2, kColorAccentDanger, 245);
+        } else {
+            const std::string ez_line = "EZ:PAIR FP:" + fp + " " + TruncAscii(state.mac, 17);
+            ui_gfx::DrawText(framebuffer_, kWidth, kHeight, 54, 156, TruncAscii(ez_line, 42), 1,
+                             kColorAccentCyan, 225);
+        }
+    } else {
+        char line4[64] = {};
+        std::snprintf(line4, sizeof(line4), "GW=%s  MAC=%s", state.gateway_connected ? "OK" : "OFF",
+                      state.mac.c_str());
+        ui_gfx::DrawText(framebuffer_, kWidth, kHeight, 54, 156, TruncAscii(line4, 42), 1,
+                         kColorHudMuted, 225);
+    }
 
     // Interactive WIFI > button in Card 1 bottom-right.
     ui_gfx::FillRoundedRect(framebuffer_, kWidth, kHeight, kDrawerWifiBtn.x, kDrawerWifiBtn.y,
@@ -1045,22 +1106,16 @@ void MosaicoUi::StepAndRender(float dt_sec, const UiSnapshot& state, std::vector
         return;
     }
 
-    std::string right_pill = state.status_tag;
-    if (right_pill.empty()) {
-        if (state.wifi_mode == WifiUiMode::kPortal) {
-            right_pill = "WIFI SETUP";
-        } else {
-            right_pill = (active_emotion == AvatarEmotion::kIdle && !state.session_tag.empty())
-                             ? state.session_tag
-                             : std::string(AvatarEmotionLabel(active_emotion));
-        }
-    }
+    const std::string right_pill = ResolveTopRightPill(state, active_emotion);
     const bool charging = state.battery_current_ma > 20.0f;
+    const bool ez_changed = (state.ez_direct_mode != last_ez_direct_) ||
+                            (state.ez_paired != last_ez_paired_) ||
+                            (state.ez_key_fp != last_ez_fp_);
     const bool hud_changed =
         force_full_refresh_ || (state.wifi_connected != last_wifi_) ||
         (state.gateway_connected != last_gateway_) || (state.wifi_mode != last_wifi_mode_) ||
         (state.battery_percent != last_bat_pct_) || (charging != last_charging_) ||
-        (right_pill != last_right_pill_);
+        (right_pill != last_right_pill_) || ez_changed;
 
     if (hud_changed || drawer_animating) {
         RenderTopHud(state, active_emotion);
@@ -1069,6 +1124,9 @@ void MosaicoUi::StepAndRender(float dt_sec, const UiSnapshot& state, std::vector
         last_wifi_mode_ = state.wifi_mode;
         last_bat_pct_ = state.battery_percent;
         last_charging_ = charging;
+        last_ez_direct_ = state.ez_direct_mode;
+        last_ez_paired_ = state.ez_paired;
+        last_ez_fp_ = state.ez_key_fp;
         last_right_pill_ = right_pill;
         if (!force_full_refresh_ && !drawer_animating) {
             out_dirty->push_back({0, 0, kWidth, 44});

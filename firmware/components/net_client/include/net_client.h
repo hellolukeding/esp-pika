@@ -134,10 +134,14 @@ public:
     bool RequestForget(const std::string& ssid);
     bool RequestPortal(bool enable);
     bool SetGatewayOverride(const std::string& host, uint16_t port);
+    WifiGatewayOverride GetGatewayOverride() const;
 
     WifiStatusSnapshot GetWifiStatus() const;
     bool IsWifiConnected() const { return wifi_connected_.load(std::memory_order_acquire); }
     bool IsPortalActive() const { return portal_active_.load(std::memory_order_acquire); }
+
+    /// Guarantees the mDNS responder/client is initialized on the station interface.
+    void EnsureMdnsStarted();
 
     /// Queries mDNS `_esp-gateway._tcp` on the local network (or applies override / fallback).
     bool DiscoverGateway(GatewayEndpoint* out_endpoint);
@@ -227,6 +231,7 @@ private:
                               int* out_reason);
     bool RunAutoConnect(const std::string& exclude_ssid = "");
     void RunRuntimeReconnect();
+    void EnsureMdnsInitialized();
     bool EnablePortalInternal(bool manual);
     void DisablePortalInternal();
     static void WifiEventHandler(void* arg, esp_event_base_t base, int32_t id, void* data);

@@ -50,10 +50,16 @@ public:
     UiService& operator=(const UiService&) = delete;
 
     void SetWifiCallbacks(UiWifiCallbacks callbacks);
+    void SetEzUnpairCallback(std::function<void()> cb);
     bool Start(Board* board, AudioEngine* audio, std::function<void()> on_wake_trigger = nullptr);
     void Stop();
 
     void SetNetworkStatus(bool wifi_connected, bool gateway_connected, const std::string& mac);
+    void SetEzStatus(bool direct_mode,
+                     bool paired,
+                     bool online,
+                     const std::string& key_fp,
+                     const std::string& host);
     void SetWifiState(const UiWifiState& wifi_state);
     void SetSessionTag(const std::string& tag);
     void SetBaseEmotion(AvatarEmotion emotion);
@@ -71,6 +77,7 @@ private:
     Board* board_ = nullptr;
     AudioEngine* audio_ = nullptr;
     std::function<void()> on_wake_trigger_;
+    std::function<void()> on_ez_unpair_;
     UiWifiCallbacks wifi_callbacks_;
     MosaicoUi ui_;
     std::atomic<bool> running_{false};

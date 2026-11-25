@@ -28,6 +28,11 @@ void UiService::SetWifiCallbacks(UiWifiCallbacks callbacks) {
     wifi_callbacks_ = std::move(callbacks);
 }
 
+void UiService::SetEzUnpairCallback(std::function<void()> cb) {
+    std::lock_guard<std::mutex> lock(mu_);
+    on_ez_unpair_ = std::move(cb);
+}
+
 bool UiService::Start(Board* board, AudioEngine* audio, std::function<void()> on_wake_trigger) {
     if (running_.load() || board == nullptr || board->Display() == nullptr) {
         return false;
@@ -42,9 +47,11 @@ bool UiService::Start(Board* board, AudioEngine* audio, std::function<void()> on
     on_wake_trigger_ = std::move(on_wake_trigger);
 
     UiWifiCallbacks wifi_cbs;
+    std::function<void()> ez_unpair_cb;
     {
         std::lock_guard<std::mutex> lock(mu_);
         wifi_cbs = wifi_callbacks_;
+        ez_unpair_cb = on_ez_unpair_;
     }
 
     UiCallbacks cbs;
@@ -68,6 +75,7 @@ bool UiService::Start(Board* board, AudioEngine* audio, std::function<void()> on
     cbs.on_wifi_forget = std::move(wifi_cbs.on_forget);
     cbs.on_wifi_toggle_portal = std::move(wifi_cbs.on_toggle_portal);
     cbs.on_wifi_panel_open = std::move(wifi_cbs.on_panel_open);
+    cbs.on_ez_unpair = std::move(ez_unpair_cb);
 
     if (!ui_.Init(std::move(cbs))) {
         return false;
@@ -122,6 +130,19 @@ void UiService::SetNetworkStatus(bool wifi_connected,
     if (!mac.empty()) {
         snapshot_.mac = mac;
     }
+}
+
+void UiService::SetEzStatus(bool direct_mode,
+                            bool paired,
+                            bool online,
+                            const std::string& key_fp,
+                            const std::string& host) {
+    std::lock_guard<std::mutex> lock(mu_);
+    snapshot_.ez_direct_mode = direct_mode;
+    snapshot_.ez_paired = paired;
+    snapshot_.gateway_connected = online;
+    snapshot_.ez_key_fp = key_fp;
+    snapshot_.ez_host = host;
 }
 
 void UiService::SetWifiState(const UiWifiState& wifi_state) {
@@ -240,11 +261,14 @@ void UiService::RunLoop() {
             if (touch->Read(&tp)) {
                 int prev_vol = local_state.volume;
                 int prev_bri = local_state.brightness;
+                bool prev_paired = local_state.ez_paired;
                 ui_.OnTouch(tp, now_ms, &local_state);
-                if (local_state.volume != prev_vol || local_state.brightness != prev_bri) {
+                if (local_state.volume != prev_vol || local_state.brightness != prev_bri ||
+                    local_state.ez_paired != prev_paired) {
                     std::lock_guard<std::mutex> lock(mu_);
                     snapshot_.volume = local_state.volume;
                     snapshot_.brightness = local_state.brightness;
+                    snapshot_.ez_paired = local_state.ez_paired;
                 }
             }
         }

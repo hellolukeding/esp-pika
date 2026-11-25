@@ -46,6 +46,11 @@ struct UiSnapshot {
     uint32_t wifi_revision = 0;
     std::vector<WifiUiEntry> wifi_entries;
 
+    bool ez_direct_mode = false;
+    bool ez_paired = false;
+    std::string ez_key_fp;
+    std::string ez_host;
+
     std::string session_tag = "SESSION-01";
     std::string status_tag; // If non-empty, overrides right pill (e.g. "THINK", "LISTEN")
 
@@ -75,6 +80,7 @@ struct UiCallbacks {
     std::function<void(const std::string& ssid)> on_wifi_forget;
     std::function<void(bool enable)> on_wifi_toggle_portal;
     std::function<void()> on_wifi_panel_open;
+    std::function<void()> on_ez_unpair;
 };
 
 /// 480x480 ESP-Mosaico compositor combining minimal HUD, 3D avatar stage,
@@ -173,6 +179,9 @@ private:
     WifiUiMode last_wifi_mode_ = WifiUiMode::kOffline;
     int last_bat_pct_ = -1;
     bool last_charging_ = false;
+    bool last_ez_direct_ = false;
+    bool last_ez_paired_ = false;
+    std::string last_ez_fp_;
     std::string last_right_pill_;
 
     // Swipe-down drawer animation state.

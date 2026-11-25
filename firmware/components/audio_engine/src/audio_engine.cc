@@ -71,6 +71,7 @@ bool AudioEngine::Init(AudioCodecHal* codec, const AudioEngineConfig& cfg) {
     }
     codec_ = codec;
     cfg_ = cfg;
+    transport_codec_.store(static_cast<int>(cfg_.transport_codec), std::memory_order_release);
     send_queue_ = std::make_unique<BoundedFrameQueue>(cfg_.max_send_frames);
     decode_queue_ = std::make_unique<BoundedFrameQueue>(cfg_.max_decode_frames);
     aec_ref_ring_ = std::make_unique<PcmPreRollBuffer>(cfg_.uplink_sample_rate / 2);
@@ -172,6 +173,10 @@ void AudioEngine::SetUplinkEnabled(bool enabled) {
     afe_.SetWakeDetectionEnabled(!enabled);
 }
 
+void AudioEngine::SetTransportCodec(AudioTransportCodec codec) {
+    transport_codec_.store(static_cast<int>(codec), std::memory_order_release);
+}
+
 void AudioEngine::HandleAfeStep(const AfeStepResult& step) {
     vad_speaking_.store(step.vad_speaking, std::memory_order_relaxed);
     if ((step.vad_started || step.vad_ended) && on_vad_) {
@@ -230,6 +235,20 @@ bool AudioEngine::EnqueueDownlinkOpus(const uint8_t* frame, size_t len) {
     }
     std::vector<uint8_t> buf(frame, frame + len);
     return decode_queue_->PushDropOldest(std::move(buf));
+}
+
+bool AudioEngine::EnqueueDownlinkPcm16(const uint8_t* pcm_bytes, size_t len) {
+    if (decode_queue_ == nullptr || pcm_bytes == nullptr || len < 2 || (len % 2) != 0) {
+        return false;
+    }
+    std::vector<uint8_t> buf(pcm_bytes, pcm_bytes + len);
+    return decode_queue_->PushDropOldest(std::move(buf));
+}
+
+void AudioEngine::ClearDownlinkQueue() {
+    if (decode_queue_) {
+        decode_queue_->Clear();
+    }
 }
 
 void AudioEngine::PlayWakeChime() {
@@ -395,11 +414,25 @@ void AudioEngine::RunInputLoop() {
                                   step.clean_pcm.end());
         }
         bool encoded = false;
-        while (uplink_pcm_buf.size() >= chunk) {
-            encode_one_chunk(uplink_pcm_buf.data());
-            uplink_pcm_buf.erase(uplink_pcm_buf.begin(),
-                                 uplink_pcm_buf.begin() + static_cast<std::ptrdiff_t>(chunk));
-            encoded = true;
+        if (TransportCodec() == AudioTransportCodec::kPcm16_20ms) {
+            constexpr size_t kPcm20MsSamples = 320;
+            while (uplink_pcm_buf.size() >= kPcm20MsSamples) {
+                const auto* raw_bytes = reinterpret_cast<const uint8_t*>(uplink_pcm_buf.data());
+                std::vector<uint8_t> pkt(raw_bytes, raw_bytes + (kPcm20MsSamples * sizeof(int16_t)));
+                send_queue_->PushDropOldest(std::move(pkt));
+                ++sent_frames;
+                uplink_pcm_buf.erase(
+                    uplink_pcm_buf.begin(),
+                    uplink_pcm_buf.begin() + static_cast<std::ptrdiff_t>(kPcm20MsSamples));
+                encoded = true;
+            }
+        } else {
+            while (uplink_pcm_buf.size() >= chunk) {
+                encode_one_chunk(uplink_pcm_buf.data());
+                uplink_pcm_buf.erase(uplink_pcm_buf.begin(),
+                                     uplink_pcm_buf.begin() + static_cast<std::ptrdiff_t>(chunk));
+                encoded = true;
+            }
         }
         if (encoded && on_uplink_opus_) {
             FlushUplink(on_uplink_opus_);
@@ -450,6 +483,7 @@ void AudioEngine::RunOutputLoop() {
             }
             wake_chime_playing_.store(false, std::memory_order_release);
         }
+        const bool raw_pcm = (TransportCodec() == AudioTransportCodec::kPcm16_20ms);
         if (!playing_downlink) {
             const size_t q_sz = decode_queue_->Size();
             if (q_sz == 0) {
@@ -462,12 +496,13 @@ void AudioEngine::RunOutputLoop() {
                 vTaskDelay(pdMS_TO_TICKS(10));
                 continue;
             }
-            if (q_sz < 6 && prebuf_ticks < 12) {
+            const size_t prebuf_target = raw_pcm ? 3U : 6U;
+            if (q_sz < prebuf_target && prebuf_ticks < 12) {
                 ++prebuf_ticks;
                 vTaskDelay(pdMS_TO_TICKS(10));
                 continue;
             }
-            if (idle_ticks >= 25 && opus_dec_ != nullptr) {
+            if (!raw_pcm && idle_ticks >= 25 && opus_dec_ != nullptr) {
                 esp_opus_dec_reset(opus_dec_);
             }
         }
@@ -500,28 +535,53 @@ void AudioEngine::RunOutputLoop() {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
-        esp_audio_dec_in_raw_t raw = {};
-        raw.buffer = pkt.data();
-        raw.len = static_cast<uint32_t>(pkt.size());
-        raw.consumed = 0;
-        raw.frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE;
-
-        esp_audio_dec_out_frame_t out_frame = {};
-        out_frame.buffer = reinterpret_cast<uint8_t*>(dma_tx_pcm_);
-        out_frame.len = static_cast<uint32_t>(tx_bytes);
-        out_frame.decoded_size = 0;
-
-        esp_audio_dec_info_t dec_info = {};
-        esp_audio_err_t dec_err = esp_opus_dec_decode(opus_dec_, &raw, &out_frame, &dec_info);
-        if (dec_err == ESP_AUDIO_ERR_OK && out_frame.decoded_size > 0) {
-            const size_t decoded_samples = out_frame.decoded_size / sizeof(int16_t);
-            if (!logged_first_decode) {
-                ESP_LOGI(kTag, "decoded downlink opus frame: raw=%u pcm_samples=%u sr=%lu ch=%u",
-                         static_cast<unsigned>(pkt.size()), static_cast<unsigned>(decoded_samples),
-                         static_cast<unsigned long>(dec_info.sample_rate),
-                         static_cast<unsigned>(dec_info.channel));
-                logged_first_decode = true;
+        size_t decoded_samples = 0;
+        bool have_pcm = false;
+        if (raw_pcm) {
+            const size_t usable_bytes = std::min(pkt.size(), tx_bytes) & ~size_t{1};
+            if (usable_bytes > 0) {
+                std::memcpy(dma_tx_pcm_, pkt.data(), usable_bytes);
+                decoded_samples = usable_bytes / sizeof(int16_t);
+                have_pcm = true;
+                if (!logged_first_decode) {
+                    ESP_LOGI(kTag, "playing downlink PCM16 frame: bytes=%u samples=%u",
+                             static_cast<unsigned>(usable_bytes),
+                             static_cast<unsigned>(decoded_samples));
+                    logged_first_decode = true;
+                }
             }
+        } else {
+            esp_audio_dec_in_raw_t raw = {};
+            raw.buffer = pkt.data();
+            raw.len = static_cast<uint32_t>(pkt.size());
+            raw.consumed = 0;
+            raw.frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE;
+
+            esp_audio_dec_out_frame_t out_frame = {};
+            out_frame.buffer = reinterpret_cast<uint8_t*>(dma_tx_pcm_);
+            out_frame.len = static_cast<uint32_t>(tx_bytes);
+            out_frame.decoded_size = 0;
+
+            esp_audio_dec_info_t dec_info = {};
+            esp_audio_err_t dec_err = esp_opus_dec_decode(opus_dec_, &raw, &out_frame, &dec_info);
+            if (dec_err == ESP_AUDIO_ERR_OK && out_frame.decoded_size > 0) {
+                decoded_samples = out_frame.decoded_size / sizeof(int16_t);
+                have_pcm = true;
+                if (!logged_first_decode) {
+                    ESP_LOGI(kTag, "decoded downlink opus frame: raw=%u pcm_samples=%u sr=%lu ch=%u",
+                             static_cast<unsigned>(pkt.size()), static_cast<unsigned>(decoded_samples),
+                             static_cast<unsigned long>(dec_info.sample_rate),
+                             static_cast<unsigned>(dec_info.channel));
+                    logged_first_decode = true;
+                }
+            } else if (decode_err_logs < 5) {
+                ++decode_err_logs;
+                ESP_LOGW(kTag, "esp_opus_dec_decode failed err=%d raw_len=%u decoded_size=%u",
+                         static_cast<int>(dec_err), static_cast<unsigned>(raw.len),
+                         static_cast<unsigned>(out_frame.decoded_size));
+            }
+        }
+        if (have_pcm && decoded_samples > 0) {
             if (!playing_downlink) {
                 const size_t fade_n = std::min<size_t>(64, decoded_samples);
                 for (size_t i = 0; i < fade_n; ++i) {
@@ -541,11 +601,6 @@ void AudioEngine::RunOutputLoop() {
             if (cfg_.afe.enable_aec && aec_ref_ring_) {
                 aec_ref_ring_->PushSamples(dma_tx_pcm_, decoded_samples);
             }
-        } else if (decode_err_logs < 5) {
-            ++decode_err_logs;
-            ESP_LOGW(kTag, "esp_opus_dec_decode failed err=%d raw_len=%u decoded_size=%u",
-                     static_cast<int>(dec_err), static_cast<unsigned>(raw.len),
-                     static_cast<unsigned>(out_frame.decoded_size));
         }
     }
 }

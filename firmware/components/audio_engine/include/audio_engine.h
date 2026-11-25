@@ -18,12 +18,19 @@
 
 namespace esp_pika {
 
+/// Uplink / downlink audio framing format on the active transport connection.
+enum class AudioTransportCodec {
+    kOpus60ms = 0, // Gateway mode: 16kHz 60ms Opus uplink / Opus downlink
+    kPcm16_20ms,   // EZ Assistant direct mode: 16kHz mono 20ms (640B) PCM16 LE
+};
+
 struct AudioEngineConfig {
     uint32_t uplink_sample_rate = 16000;
     uint32_t downlink_sample_rate = 24000;
     uint16_t frame_ms = 60;
-    size_t max_send_frames = 40;    // 40 * 60ms = 2.4s cap per architecture.md
-    size_t max_decode_frames = 512; // Absorb burst DeepSeek WS TTS packets (~10.2s buffer)
+    AudioTransportCodec transport_codec = AudioTransportCodec::kOpus60ms;
+    size_t max_send_frames = 120;   // 120 * 20ms = 2.4s PCM16 or >= 2.4s Opus cap
+    size_t max_decode_frames = 512; // Absorb burst TTS packets (~10.2s buffer)
     AfePipelineConfig afe;
 };
 
@@ -57,6 +64,12 @@ public:
     void SetUplinkEnabled(bool enabled);
     bool IsUplinkEnabled() const { return uplink_enabled_.load(); }
 
+    /// Switches uplink/downlink transport framing dynamically between Opus 60ms and PCM16 20ms.
+    void SetTransportCodec(AudioTransportCodec codec);
+    AudioTransportCodec TransportCodec() const {
+        return static_cast<AudioTransportCodec>(transport_codec_.load(std::memory_order_acquire));
+    }
+
     /// Feeds one captured 16kHz mono PCM frame through AFE/VAD/Pre-roll (used by Core 0 loop and host tests).
     bool ProcessCapturedPcm(const int16_t* mic_pcm, size_t samples, AfeStepResult* out = nullptr);
 
@@ -65,6 +78,12 @@ public:
 
     /// Enqueues a 24kHz Opus downlink frame into bounded DecodeQ.
     bool EnqueueDownlinkOpus(const uint8_t* frame, size_t len);
+
+    /// Enqueues a 16kHz mono little-endian PCM16 downlink chunk into bounded DecodeQ.
+    bool EnqueueDownlinkPcm16(const uint8_t* pcm_bytes, size_t len);
+
+    /// Clears only buffered downlink frames (e.g. barge-in playback_cancel) without touching uplink.
+    void ClearDownlinkQueue();
 
     /// Triggers an immediate local ascending wake-confirmation chime on Core 0.
     void PlayWakeChime();
@@ -101,6 +120,7 @@ private:
     VadStateCallback on_vad_;
     std::atomic<bool> running_{false};
     std::atomic<bool> uplink_enabled_{false};
+    std::atomic<int> transport_codec_{static_cast<int>(AudioTransportCodec::kOpus60ms)};
     std::atomic<bool> wake_chime_pending_{false};
     std::atomic<bool> wake_chime_playing_{false};
     std::atomic<uint32_t> skip_uplink_samples_{0};
