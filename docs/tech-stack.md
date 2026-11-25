@@ -1,8 +1,8 @@
 # ESP32-S31 智能语音与多模态 Agent 终端技术选型文档
 
-> **版本**：v1.2  
-> **关联架构**：[architecture.md](./architecture.md)（v1.4）  
-> **状态**：固件层（支持 **EZ Assistant 原生直连** 与 **Go Kratos 网关集群** 双模）、网关与微服务层（**Go Kratos 原生 gRPC + NATS 事件总线**）、数据存储层已定型；**Agent 大脑层待定（后续接入自研 Agent 代码，已预留语言无关的 gRPC / NATS + MCP 接入契约）**。
+> **版本**：v1.3  
+> **关联架构**：[architecture.md](./architecture.md)（v1.5）  
+> **状态**：固件层（支持 **EZ Assistant 原生直连（含 WSS 硬件指令、原生控制面板/ACL/Loopback MCP 与端侧声纹同步）** 与 **Go Kratos 网关集群** 双模）、网关与微服务层（**Go Kratos 原生 gRPC + NATS 事件总线**）、数据存储层已定型；**Agent 大脑层待定（后续接入自研 Agent 代码，已预留语言无关的 gRPC / NATS + MCP 接入契约）**。
 
 ---
 
@@ -62,8 +62,9 @@
    * Agent → 网关（流式事件）：`OnStatus(state, msg)`、`OnTextDelta(chunk)`、`OnUIUpdate(target, display)`、`OnDone()`。
 2. **硬件能力调用契约（Device MCP Server）**：
    * 无论自研 Agent 使用 Python、Go、TypeScript 还是 Rust，均可直接通过标准 **MCP（Streamable HTTP / stdio）** 发现并调用 `fleet://topology` 及所有终端的摄像头、传感器、执行器与声纹管理工具。
-3. **EZ Assistant Desktop 控制面板代理与双向语音中继（Device Protocol 1.0 扩展）**：
-   * 网关向已配对 `ez-assistant` Host 的 `DeviceHello` 声明 `console` 与 `speech_relay: true`；Host 提供固定 `peer_ip` 的 `/devices/{device_id}/console/{*path}` 受控反代（禁重定向、`settings/deepseek` 屏蔽、10 MiB 上限），并在 WSS 上扩展 `speech_asr_*`（kind=3 变长 PCM16 上行）与 `speech_tts_*`（kind=4 变长 PCM16 下行）中继帧，网关侧结合纯 Go WAV 重采样与 `ffmpeg` Opus 编解码复用 Desktop 语音服务并保留本地回退。
+3. **EZ Assistant Desktop 控制面板代理、直连原生控制台与双向语音中继（Device Protocol 1.0 扩展）**：
+   * **网关代理模式**：网关向已配对 `ez-assistant` Host 的 `DeviceHello` 声明 `console` 与 `speech_relay: true`；Host 提供固定 `peer_ip` 的 `/devices/{device_id}/console/{*path}` 受控反代（禁重定向、`settings/deepseek` 屏蔽、10 MiB 上限），并在 WSS 上扩展 `speech_asr_*`（kind=3 变长 PCM16 上行）与 `speech_tts_*`（kind=4 变长 PCM16 下行）中继帧。
+   * **直连原生模式（Phase 2）**：直连终端通过 `hello.hardware` 声明硬件档案与能力，复用已认证 WSS 通道收发 `device_command` / `device_command_result` 与 `voiceprint_sync` / `voiceprint_sync_ack`；Host 内置原生 `/api/v1/*` 控制台后端、192 维 FBank 声纹库（与固件 `FbankExtractor` 数值对齐）、持久化 `Agent → Device ACL` 校验及带随机 Bearer 令牌的 `127.0.0.1` 受管 MCP 桥接，实现完全脱离 Go 网关与外部 Qdrant 的端云一体控制与声纹管理。
 
 ---
 

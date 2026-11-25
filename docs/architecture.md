@@ -1,8 +1,8 @@
 # ESP32-S31 智能语音与多模态 Agent 终端系统架构设计文档
 
-> **版本**：v1.4  
+> **版本**：v1.5  
 > **目标硬件**：ESP32-S31（兼容 ESP32-S3 / P4 高性能平台，支持 C3 / C5 / C6 / ESP32 轻量降级）  
-> **开发框架**：ESP-IDF v6.x（终端）+ EZ Assistant `Device Protocol 1.0` 原生直连（默认消费级模式） / Go Kratos v2 + NATS JetStream（集群网关模式）
+> **开发框架**：ESP-IDF v6.x（终端）+ EZ Assistant `Device Protocol 1.0` 原生直连与原生控制面板/MCP/声纹（默认消费级模式） / Go Kratos v2 + NATS JetStream（集群网关模式）
 
 ---
 
@@ -239,6 +239,11 @@ model,            data, spiffs,  ,         4M,     readonly
    * **一键免码安全配对**：EZ Assistant 桌面端自动浏览 `_ez-device._tcp.local.` 并展示附近设备；用户点击「连接」后，桌面端自动启用接入开关、为该设备的 Ed25519 公钥指纹（`pk_fp`）与对端 IP 开启 60 秒定向自动审批窗口，并向终端 `POST http://<mosaico-ip>:8765/ez/connect` 下发 WSS 连接参数（同时以 `_ez-assistant._tcp.local.` mDNS 广播作为回退）。
    * **TLS 证书钉扎与 RFC 8032 Ed25519 长期身份**：终端使用叶证书 SHA-256 指纹钉扎建立 WSS `/device` 连接，完成 `direct_confirm` 挑战签名后将 `{installation_id, cert_fingerprint, device_id, ed25519_seed}` 写入加密 NVS 命名空间 `ez_pair`，随后自动停用 `_ez-device._tcp` 与 `8765` 端口监听，并凭 `hello` + 动态端口 mDNS（`_ez-assistant._tcp.local.`）实现无感断线重连。
    * **端到端 20ms PCM16 语音流与打断**：`AudioEngine` 切换为 `AudioTransportCodec::kPcm16_20ms`，直接发送 `listen_start` + 656 字节定长二进制帧（16 字节大端头部 + 640 字节 16 kHz 单声道 PCM16，`kind=1`），并接收 Host 下行 `playback_start` / `kind=2` PCM16 播放与 `playback_cancel` 本地声学打断（Barge-in），全程复用 EZ Assistant 配置的大模型、ASR 与 TTS 音色。
+   * **Phase 2 原生直连控制面板、WSS 硬件指令、自动 MCP 与端云协同声纹（零外部网关）**：
+     * **零新增端口的 WSS 硬件控制**：直连终端在已认证的 `hello.hardware` 中声明硬件档案（`mac`、`chip`、`model`、`zone`、`group_id`、`vp_version`、`capabilities`）；Host 与终端复用已钉扎证书的 WSS `/device` 通道收发 `device_command` / `device_command_result`（由终端 Core 1 片内 DRAM 栈上的 `LocalExecutor` 执行 `device.display_show`、`device.audio_set_volume`、`device.sensor_read`、`device.actuator_set`、`device.status_read`、`device.voiceprint_list`、`device.voiceprint_delete` 等能力），不在局域网暴露无鉴权 HTTP 控制面。
+     * **Host 内置原生控制面板 & ACL 权限矩阵**：EZ Assistant Runtime 为直连终端自动投影 `console.mode = "native"`，在 `/devices/{device_id}/console/api/v1/*` 本地提供硬件遥测与指令下发、持久化 `Agent → Device ACL` 权限矩阵（`<runtime_home>/device/native_console.json`）及内置 ASR 语音转写验证；桌面端设备详情页原生呈现「概览 / 设备控制与状态 / ACL 权限矩阵 / 声纹与语音」四个页签。
+     * **自动受管 Loopback MCP 桥接**：EZ Assistant Runtime 随 `DeviceGatewayService` 在 `127.0.0.1:0` 启动带 256-bit 随机 Bearer 令牌的私有 Streamable HTTP MCP 桥接（`POST /mcp/{device_id}`），并通过 `sync_device_mcp_servers` 自动注册为当前终端的受管 MCP 工具服务；Agent 调用任何硬件工具前均强制校验 `Agent → Device ACL` 并经 WSS 路由至终端执行。
+     * **端云一致的 192 维声纹管理与加密 NVS 同步**：EZ Assistant Runtime 内置与终端 `FbankExtractor` + `ComputePooledFbankEmbedding` 完全一致的 192 维 L2 归一化声纹提取器与持久化声纹库；桌面端录音注册、修改或删除说话人后，Host 经 WSS 下发 `voiceprint_sync`（终端确认 `voiceprint_sync_ack`），由终端 Core 1 写入加密 NVS `VoiceprintStore`，并在唤醒时本地声纹匹配后可选透传说话人元数据。
    * **本地与远端解绑**：收到 `device_revoked` 错误或在 Mosaico 抽屉点击 `UNPAIR` 后，清空 NVS 配对记录（保留 Ed25519 密钥对）并重新广播 `_ez-device._tcp.local.` 等待重新连接。
 2. **网关集群模式（高级，`gateway_override.enabled == true`）**：
    * 当用户通过配网门户显式指定网关地址 `host:port` 时，终端回退原有 `_esp-gateway._tcp.local.` / `/ws/device` + `AudioTransportCodec::kOpus60ms` 路径，保留 MAC 白名单、NATS JetStream 多机唤醒仲裁、Qdrant 3D-Speaker 声纹集群与 Device MCP Server 完整能力。
