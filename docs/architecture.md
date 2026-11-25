@@ -1,8 +1,8 @@
 # ESP32-S31 智能语音与多模态 Agent 终端系统架构设计文档
 
-> **版本**：v1.3  
+> **版本**：v1.4  
 > **目标硬件**：ESP32-S31（兼容 ESP32-S3 / P4 高性能平台，支持 C3 / C5 / C6 / ESP32 轻量降级）  
-> **开发框架**：ESP-IDF v6.x（终端）+ Go Kratos v2（网关/gRPC）+ NATS JetStream（事件与广播总线）
+> **开发框架**：ESP-IDF v6.x（终端）+ EZ Assistant `Device Protocol 1.0` 原生直连（默认消费级模式） / Go Kratos v2 + NATS JetStream（集群网关模式）
 
 ---
 
@@ -229,6 +229,19 @@ model,            data, spiffs,  ,         4M,     readonly
 ```
 
 > 注：ESP32-S31 建议启用 ROM 级 **Recovery Bootloader** 与防回滚配置，进一步提高 OTA 升级安全性。
+
+### 4.7 双模传输架构：EZ Assistant 原生直连（默认）与网关集群模式
+
+为兼顾**消费级零配置即插即用**与**多终端企业/极客集群调度**，Mosaico 终端（ESP32-S31）在网络与音频传输层采用**双模自动切换架构**（以 `WifiStore::GatewayOverride().enabled` 作为模式开关）：
+
+1. **EZ Assistant 原生直连模式（默认，`gateway_override.enabled == false`）**：
+   * **零网关广播与发现**：未配对且连上 Wi-Fi 时，终端通过 `EzDeviceClient` 启动端口 `8765` 的轻量控制服务（`GET /ez/info`、`POST /ez/connect`）并通过 mDNS 广播 `_ez-device._tcp.local.`（TXT 携带 `v=1`、`mac`、`name`、`model`、`paired=0`、`pk_fp`、`fw`）。
+   * **一键免码安全配对**：EZ Assistant 桌面端自动浏览 `_ez-device._tcp.local.` 并展示附近设备；用户点击「连接」后，桌面端自动启用接入开关、为该设备的 Ed25519 公钥指纹（`pk_fp`）与对端 IP 开启 60 秒定向自动审批窗口，并向终端 `POST http://<mosaico-ip>:8765/ez/connect` 下发 WSS 连接参数（同时以 `_ez-assistant._tcp.local.` mDNS 广播作为回退）。
+   * **TLS 证书钉扎与 RFC 8032 Ed25519 长期身份**：终端使用叶证书 SHA-256 指纹钉扎建立 WSS `/device` 连接，完成 `direct_confirm` 挑战签名后将 `{installation_id, cert_fingerprint, device_id, ed25519_seed}` 写入加密 NVS 命名空间 `ez_pair`，随后自动停用 `_ez-device._tcp` 与 `8765` 端口监听，并凭 `hello` + 动态端口 mDNS（`_ez-assistant._tcp.local.`）实现无感断线重连。
+   * **端到端 20ms PCM16 语音流与打断**：`AudioEngine` 切换为 `AudioTransportCodec::kPcm16_20ms`，直接发送 `listen_start` + 656 字节定长二进制帧（16 字节大端头部 + 640 字节 16 kHz 单声道 PCM16，`kind=1`），并接收 Host 下行 `playback_start` / `kind=2` PCM16 播放与 `playback_cancel` 本地声学打断（Barge-in），全程复用 EZ Assistant 配置的大模型、ASR 与 TTS 音色。
+   * **本地与远端解绑**：收到 `device_revoked` 错误或在 Mosaico 抽屉点击 `UNPAIR` 后，清空 NVS 配对记录（保留 Ed25519 密钥对）并重新广播 `_ez-device._tcp.local.` 等待重新连接。
+2. **网关集群模式（高级，`gateway_override.enabled == true`）**：
+   * 当用户通过配网门户显式指定网关地址 `host:port` 时，终端回退原有 `_esp-gateway._tcp.local.` / `/ws/device` + `AudioTransportCodec::kOpus60ms` 路径，保留 MAC 白名单、NATS JetStream 多机唤醒仲裁、Qdrant 3D-Speaker 声纹集群与 Device MCP Server 完整能力。
 
 ---
 

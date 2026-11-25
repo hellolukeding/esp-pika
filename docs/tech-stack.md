@@ -1,8 +1,8 @@
 # ESP32-S31 智能语音与多模态 Agent 终端技术选型文档
 
-> **版本**：v1.1  
-> **关联架构**：[architecture.md](./architecture.md)（v1.3）  
-> **状态**：固件层、网关与微服务层（**Go Kratos 原生 gRPC + NATS 事件总线**）、数据存储层已定型；**Agent 大脑层待定（后续接入自研 Agent 代码，已预留语言无关的 gRPC / NATS + MCP 接入契约）**。
+> **版本**：v1.2  
+> **关联架构**：[architecture.md](./architecture.md)（v1.4）  
+> **状态**：固件层（支持 **EZ Assistant 原生直连** 与 **Go Kratos 网关集群** 双模）、网关与微服务层（**Go Kratos 原生 gRPC + NATS 事件总线**）、数据存储层已定型；**Agent 大脑层待定（后续接入自研 Agent 代码，已预留语言无关的 gRPC / NATS + MCP 接入契约）**。
 
 ---
 
@@ -14,11 +14,11 @@
 | **构建与环境** | **EIM + CMake + Ninja + `idf.py`** | — | ESP-IDF v6.x 官方推荐工作流，跨 macOS / Linux / Windows 一致 |
 | **音频前处理 / VAD / 唤醒** | **`espressif/esp-sr`**（AFE: AEC + NS/BSS + VADNet + WakeNet / MultiNet） | Silero VAD (TFLM) | 官方量化优化流水线，统一处理回声消除、降噪、VAD 与离线唤醒 |
 | **端侧声纹识别** | **`espressif/esp-dsp`**（FBank/MFCC）+ **`espressif/esp-dl`**（INT8 轻量模型：ECAPA-TDNN Lite / Tiny-CAM++） | `esp-tflite-micro` (ESP-NN) | ESP-DL 针对乐鑫芯片优化；先以唤醒词文本相关（1.0~1.5 s PCM）模式快速落地 |
-| **音频编解码** | **`espressif/esp_audio_codec`**（Opus + 重采样） | `libopus` | 官方维护组件，支持上行 16 kHz Opus 编码、下行 24 kHz Opus 解码与采样率对齐 |
-| **局域网服务发现** | **`espressif/mdns`** | UDP Broadcast | 自动发现局域网网关 `_esp-gateway._tcp.local`，免硬编码 IP |
+| **音频编解码** | **`espressif/esp_audio_codec`**（Opus + 重采样）+ **`AudioTransportCodec::kPcm16_20ms`** | `libopus` | 网关模式走上行 16 kHz / 下行 24 kHz Opus；EZ Assistant 直连模式采用 20 ms 16 kHz Mono PCM16 零转码直传，降本降延迟 |
+| **局域网服务发现** | **`espressif/mdns`**（双向发现：`_ez-device._tcp` 广播 + `_ez-assistant._tcp` / `_esp-gateway._tcp` 解析） | UDP Broadcast | 终端未配对时自动向桌面端可见；配对后按 `installation_id` 自动追踪桌面端动态端口 |
 | **Wi-Fi 管理与双模配网** | **NVS 多网络凭据（`wifi_store`）+ SoftAP Captive Portal（`esp_http_server` + UDP:53 DNS）+ Mosaico 原生触摸屏 Wi-Fi/软键盘 UI** | 仅 Kconfig 静态 SSID 或仅 BLE 配网 | 支持最多 8 组 Wi-Fi 记忆与按信号强弱自动故障转移；同时提供设备屏内直接切网/输密码与零 App 手机 Captive Portal 配网，配网成功后自动关闭热点 |
-| **设备身份与认证** | **出厂 eFuse 硬件 MAC**（`esp_efuse_mac_get_default()`） | 后续可叠加 `ECDSA_DS`/`HMAC` 签名 | 全局唯一、免烧录凭证；所有通道强制校验 MAC 白名单 |
-| **通信接入协议** | **Phase 1: `esp_websocket_client`（WSS）** + **`esp_http_client`（JPEG 上传）** | Phase 2+ 可扩展 `esp-mqtt` + UDP | WS 单连接同时跑控制 JSON 与 Opus 二进制帧，联调成本最低；大图走独立 HTTP POST 不阻塞音频 |
+| **设备身份与认证** | **RFC 8032 Ed25519（`ed25519_lite` + TLS 证书 SHA-256 指纹钉扎）** + **出厂 eFuse 硬件 MAC** | 后续可叠加 `ECDSA_DS`/`HMAC` 签名 | 直连模式走 Device Protocol 1.0 `direct_confirm` 免码一键绑定与加密 NVS（`ez_pair`）持久化；网关模式强制校验 eFuse MAC 白名单 |
+| **通信接入协议** | **`EzDeviceClient`（Device Protocol 1.0 直连 WSS `/device`）** + `NetClient`（网关 `/ws/device` + HTTP JPEG 上传） | Phase 2+ 可扩展 `esp-mqtt` + UDP | `net_client` 组件按是否配置网关覆盖地址自动切换直连与集群网关双模，大图走独立 HTTP POST 不阻塞音频 |
 | **显示与视觉** | **`esp_lcd` + LVGL 9**（ESP32-S31 PPA 加速）+ **`esp_video` / 硬件 JPEG** | OLED (SSD1306) | 利用 ESP32-S31 硬件 JPEG 编解码和 PPA 卸载 CPU 负载 |
 | **本地存储** | **加密 NVS** + 只读模型分区（SPIFFS / Raw Partition） | LittleFS | 加密 NVS 保护 Wi-Fi 凭据与端侧声纹模板库 |
 
