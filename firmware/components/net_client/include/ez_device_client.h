@@ -30,7 +30,7 @@ enum class EzClientState {
 struct EzDeviceClientConfig {
     std::string mac;
     std::string display_name = "Mosaico";
-    std::string firmware_version = "0.4.0-direct";
+    std::string firmware_version = "0.5.0-direct";
     uint16_t control_port = 8765;
     EzHardwareProfile hardware;
 };
@@ -50,6 +50,8 @@ struct EzDeviceCallbacks {
     std::function<void(const EzDeviceCommandRequest& cmd)> on_device_command;
     /// Invoked on Core 1 internal-DRAM task inside TickFast() with raw `voiceprint_sync` JSON payload.
     std::function<void(const std::string& raw_payload)> on_voiceprint_sync;
+    /// Invoked on Core 1 internal-DRAM task inside TickFast() with parsed `wake_config_sync`.
+    std::function<void(const EzWakeConfigSyncRequest& sync)> on_wake_config_sync;
 };
 
 /// Direct Device Protocol 1.0 client for EZ Assistant Desktop:
@@ -79,6 +81,11 @@ public:
 
     /// Starts a voice listen segment (`pcm_s16le`, 16kHz mono, 20ms) if authenticated and ASR ready.
     bool StartListen(uint32_t* out_stream_id);
+    bool StartListenWithContext(uint32_t* out_stream_id,
+                                const std::string& wake_source,
+                                const std::string& speaker_id = "",
+                                int speaker_role = 0,
+                                float speaker_score = 0.0f);
     bool SendUplinkPcmFrame(uint32_t stream_id, uint32_t sequence, const uint8_t pcm640[640]);
     bool StopListen(uint32_t stream_id, uint32_t last_sequence);
     bool CancelListen(uint32_t stream_id);
@@ -93,7 +100,12 @@ public:
                                uint32_t count,
                                bool ok,
                                const std::string& error = "");
+    bool SendWakeConfigAck(const std::string& sync_id,
+                           bool ok,
+                           const EzWakeConfig* active_config = nullptr,
+                           const std::string& error = "");
     void SetVoiceprintVersion(uint64_t vp_version);
+    void SetWakeConfig(const EzWakeConfig& wake_config, bool multinet_ready);
 
     EzClientState State() const {
         return static_cast<EzClientState>(state_.load(std::memory_order_acquire));
@@ -149,6 +161,7 @@ private:
     EzCapabilities caps_;
     std::vector<EzDeviceCommandRequest> pending_commands_;
     std::vector<std::string> pending_vp_syncs_;
+    std::vector<EzWakeConfigSyncRequest> pending_wake_syncs_;
 
     // Active pairing / auth handshake state protected by `mu_`
     bool ws_pairing_mode_ = false;

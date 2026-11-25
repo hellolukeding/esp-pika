@@ -47,6 +47,7 @@ bool VoiceprintEngine::Init(VoiceprintStore* store, const VoiceprintConfig& cfg)
     }
     store_ = store;
     cfg_ = cfg;
+    accept_threshold_.store(std::clamp(cfg.accept_threshold, 0.55f, 0.95f), std::memory_order_relaxed);
     if (!fbank_.Init()) {
         return false;
     }
@@ -260,6 +261,10 @@ bool VoiceprintEngine::EnrollFromSamples(const std::string& speaker_id,
     return store_->Upsert(std::move(tpl));
 }
 
+void VoiceprintEngine::SetAcceptThreshold(float threshold) {
+    accept_threshold_.store(std::clamp(threshold, 0.55f, 0.95f), std::memory_order_relaxed);
+}
+
 bool VoiceprintEngine::Identify(const int16_t* pcm, size_t samples, VoiceprintMatch* out) const {
     if (!initialized_ || store_ == nullptr || out == nullptr) {
         return false;
@@ -292,14 +297,18 @@ bool VoiceprintEngine::Identify(const int16_t* pcm, size_t samples, VoiceprintMa
     if (best_tpl == nullptr) {
         return true;
     }
-    out->speaker_id = best_tpl->speaker_id;
+    const size_t hash_pos = best_tpl->speaker_id.find('#');
+    out->speaker_id = (hash_pos != std::string::npos) ? best_tpl->speaker_id.substr(0, hash_pos)
+                                                      : best_tpl->speaker_id;
     out->display_name = best_tpl->display_name;
 
-    if (best_score >= cfg_.accept_threshold) {
+    const float accept_th = accept_threshold_.load(std::memory_order_relaxed);
+    const float uncertain_th = std::min(cfg_.uncertain_threshold, accept_th);
+    if (best_score >= accept_th) {
         out->identified = true;
         out->tier = ConfidenceTier::kAcceptLocal;
         out->role = best_tpl->role;
-    } else if (best_score >= cfg_.uncertain_threshold) {
+    } else if (best_score >= uncertain_th) {
         out->identified = false;
         out->tier = ConfidenceTier::kUncertainCloud;
         out->role = SpeakerRole::kGuest;

@@ -2,6 +2,7 @@
 #include "chime_pcm.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 
@@ -125,13 +126,15 @@ bool AudioEngine::Init(AudioCodecHal* codec, const AudioEngineConfig& cfg) {
 
 bool AudioEngine::Start(OpusUplinkCallback on_uplink_opus,
                         WakeEventCallback on_wake,
-                        VadStateCallback on_vad) {
+                        VadStateCallback on_vad,
+                        VoiceprintCandidateCallback on_vp_candidate) {
     if (codec_ == nullptr || running_.load()) {
         return false;
     }
     on_uplink_opus_ = std::move(on_uplink_opus);
     on_wake_ = std::move(on_wake);
     on_vad_ = std::move(on_vad);
+    on_vp_candidate_ = std::move(on_vp_candidate);
     running_.store(true);
 
 #ifdef ESP_PLATFORM
@@ -169,8 +172,261 @@ void AudioEngine::Stop() {
 }
 
 void AudioEngine::SetUplinkEnabled(bool enabled) {
-    uplink_enabled_.store(enabled);
-    afe_.SetWakeDetectionEnabled(!enabled);
+    uplink_enabled_.store(enabled, std::memory_order_release);
+    const bool allow_wake_word =
+        !enabled && (WakeMode() != AudioWakeMode::kVoiceprintDirect) &&
+        !capture_active_.load(std::memory_order_acquire);
+    afe_.SetWakeDetectionEnabled(allow_wake_word);
+    if (!enabled) {
+        std::lock_guard<std::mutex> lock(spec_mu_);
+        spec_pcm_.clear();
+        pending_flush_pcm_.clear();
+        if (spec_state_ == SpeculativeState::kCollecting ||
+            spec_state_ == SpeculativeState::kEvaluating) {
+            spec_state_ = SpeculativeState::kIdle;
+        }
+    }
+}
+
+void AudioEngine::SetWakeMode(AudioWakeMode mode, uint32_t min_speech_ms, uint32_t cooldown_ms) {
+    wake_mode_.store(static_cast<int>(mode), std::memory_order_release);
+    vp_min_speech_ms_.store(std::clamp<uint32_t>(min_speech_ms, 400U, 1500U),
+                            std::memory_order_relaxed);
+    vp_cooldown_ms_.store(std::clamp<uint32_t>(cooldown_ms, 500U, 5000U),
+                          std::memory_order_relaxed);
+    const bool allow_wake_word =
+        (mode != AudioWakeMode::kVoiceprintDirect) &&
+        !uplink_enabled_.load(std::memory_order_acquire) &&
+        !capture_active_.load(std::memory_order_acquire);
+    afe_.SetWakeDetectionEnabled(allow_wake_word);
+    std::lock_guard<std::mutex> lock(spec_mu_);
+    spec_state_ = SpeculativeState::kIdle;
+    spec_voiced_ms_ = 0;
+    spec_cooldown_rem_ms_ = 0;
+    spec_pcm_.clear();
+    pending_flush_pcm_.clear();
+}
+
+bool AudioEngine::UpdateWakePinyin(const std::string& wake_word,
+                                   const std::string& wake_pinyin,
+                                   std::string* error_out) {
+    return afe_.UpdateWakePinyin(wake_word, wake_pinyin, running_.load(std::memory_order_acquire),
+                                 error_out);
+}
+
+bool AudioEngine::AcceptSpeculativeWake(uint32_t generation) {
+    {
+        std::lock_guard<std::mutex> lock(spec_mu_);
+        if (generation == 0 || spec_gen_ != generation ||
+            spec_state_ != SpeculativeState::kEvaluating) {
+            return false;
+        }
+        pending_flush_pcm_.swap(spec_pcm_);
+        spec_pcm_.clear();
+        spec_voiced_ms_ = 0;
+        spec_state_ = SpeculativeState::kIdle;
+    }
+    uplink_enabled_.store(true, std::memory_order_release);
+    afe_.SetWakeDetectionEnabled(false);
+    return true;
+}
+
+void AudioEngine::RejectSpeculativeWake(uint32_t generation) {
+    std::lock_guard<std::mutex> lock(spec_mu_);
+    if (generation == 0 || spec_gen_ != generation) {
+        return;
+    }
+    spec_pcm_.clear();
+    spec_voiced_ms_ = 0;
+    spec_cooldown_rem_ms_ = vp_cooldown_ms_.load(std::memory_order_relaxed);
+    spec_state_ = SpeculativeState::kCooldown;
+}
+
+bool AudioEngine::TakePendingSpeculativePcm(std::vector<int16_t>* out) {
+    if (out == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(spec_mu_);
+    if (pending_flush_pcm_.empty()) {
+        return false;
+    }
+    out->swap(pending_flush_pcm_);
+    pending_flush_pcm_.clear();
+    return true;
+}
+
+bool AudioEngine::CaptureSpeechSample(uint32_t max_ms,
+                                      std::vector<int16_t>* out_pcm,
+                                      uint32_t* out_voiced_ms,
+                                      float* out_snr_db) {
+    if (out_pcm == nullptr) {
+        return false;
+    }
+    const uint32_t clamped_ms = std::clamp<uint32_t>(max_ms, 1200U, 4500U);
+    {
+        std::lock_guard<std::mutex> lock(capture_mu_);
+        if (capture_active_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        capture_pcm_.clear();
+        capture_pcm_.reserve((cfg_.uplink_sample_rate * clamped_ms) / 1000U + 1600U);
+        capture_done_ = false;
+        capture_max_ms_ = clamped_ms;
+        capture_elapsed_ms_ = 0;
+        capture_voiced_ms_ = 0;
+        capture_silence_ms_ = 0;
+        capture_peak_snr_db_ = 0.0f;
+        capture_active_.store(true, std::memory_order_release);
+    }
+    afe_.SetWakeDetectionEnabled(false);
+
+    std::unique_lock<std::mutex> lock(capture_mu_);
+    capture_cv_.wait_for(lock, std::chrono::milliseconds(clamped_ms + 1800U),
+                         [this]() { return capture_done_ || !running_.load(); });
+    capture_active_.store(false, std::memory_order_release);
+    *out_pcm = std::move(capture_pcm_);
+    capture_pcm_.clear();
+    if (out_voiced_ms != nullptr) {
+        *out_voiced_ms = capture_voiced_ms_;
+    }
+    if (out_snr_db != nullptr) {
+        *out_snr_db = capture_peak_snr_db_;
+    }
+    lock.unlock();
+
+    const bool allow_wake_word =
+        (WakeMode() != AudioWakeMode::kVoiceprintDirect) &&
+        !uplink_enabled_.load(std::memory_order_acquire);
+    afe_.SetWakeDetectionEnabled(allow_wake_word);
+    return !out_pcm->empty();
+}
+
+void AudioEngine::UpdateCaptureSample(const AfeStepResult& step, uint32_t frame_ms) {
+    if (!capture_active_.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(capture_mu_);
+    if (!capture_active_.load(std::memory_order_relaxed)) {
+        return;
+    }
+    constexpr size_t kMaxCaptureSamples = 16000U * 5U; // 5s max in PSRAM
+    if (!step.clean_pcm.empty() && capture_pcm_.size() < kMaxCaptureSamples) {
+        const size_t room = kMaxCaptureSamples - capture_pcm_.size();
+        const size_t copy_n = std::min(step.clean_pcm.size(), room);
+        capture_pcm_.insert(capture_pcm_.end(), step.clean_pcm.begin(),
+                            step.clean_pcm.begin() + static_cast<std::ptrdiff_t>(copy_n));
+    }
+    capture_elapsed_ms_ += frame_ms;
+    if (step.vad_speaking) {
+        capture_voiced_ms_ += frame_ms;
+        capture_silence_ms_ = 0;
+        if (step.snr_db > capture_peak_snr_db_) {
+            capture_peak_snr_db_ = step.snr_db;
+        }
+    } else if (capture_voiced_ms_ > 0) {
+        capture_silence_ms_ += frame_ms;
+    }
+    if ((capture_voiced_ms_ >= 1000U && capture_silence_ms_ >= 600U) ||
+        capture_elapsed_ms_ >= capture_max_ms_) {
+        capture_active_.store(false, std::memory_order_release);
+        capture_done_ = true;
+        capture_cv_.notify_all();
+    }
+}
+
+void AudioEngine::UpdateSpeculativeVoiceprint(const AfeStepResult& step, uint32_t frame_ms) {
+    if (WakeMode() != AudioWakeMode::kVoiceprintDirect ||
+        uplink_enabled_.load(std::memory_order_acquire) ||
+        capture_active_.load(std::memory_order_acquire) || !on_vp_candidate_) {
+        return;
+    }
+    const bool speaker_playing =
+        (decode_queue_ != nullptr && decode_queue_->Size() > 0) ||
+        (spk_rms_.load(std::memory_order_relaxed) > 0.01f);
+    if (speaker_playing) {
+        return;
+    }
+
+    constexpr size_t kMaxSpecSamples = 40000U; // 2.5s @ 16kHz (~80KB in PSRAM)
+    constexpr float kMinSpecSnrDb = 5.0f;
+    const uint32_t min_speech_ms = vp_min_speech_ms_.load(std::memory_order_relaxed);
+
+    bool emit_candidate = false;
+    VoiceprintCandidateEvent cand;
+    {
+        std::lock_guard<std::mutex> lock(spec_mu_);
+        switch (spec_state_) {
+        case SpeculativeState::kCooldown:
+            if (spec_cooldown_rem_ms_ > frame_ms) {
+                spec_cooldown_rem_ms_ -= frame_ms;
+            } else {
+                spec_cooldown_rem_ms_ = 0;
+            }
+            if (spec_cooldown_rem_ms_ == 0 && !step.vad_speaking) {
+                spec_state_ = SpeculativeState::kIdle;
+            }
+            break;
+
+        case SpeculativeState::kIdle:
+            if (step.vad_started || step.vad_speaking) {
+                spec_pcm_.clear();
+                spec_pcm_.reserve(kMaxSpecSamples);
+                if (!step.pre_roll_pcm.empty()) {
+                    const size_t n = std::min(step.pre_roll_pcm.size(), kMaxSpecSamples);
+                    spec_pcm_.insert(spec_pcm_.end(), step.pre_roll_pcm.begin(),
+                                     step.pre_roll_pcm.begin() + static_cast<std::ptrdiff_t>(n));
+                }
+                if (!step.clean_pcm.empty() && spec_pcm_.size() < kMaxSpecSamples) {
+                    const size_t n = std::min(step.clean_pcm.size(), kMaxSpecSamples - spec_pcm_.size());
+                    spec_pcm_.insert(spec_pcm_.end(), step.clean_pcm.begin(),
+                                     step.clean_pcm.begin() + static_cast<std::ptrdiff_t>(n));
+                }
+                spec_voiced_ms_ = step.vad_speaking ? frame_ms : 0;
+                spec_state_ = SpeculativeState::kCollecting;
+            }
+            break;
+
+        case SpeculativeState::kCollecting: {
+            if (!step.clean_pcm.empty() && spec_pcm_.size() < kMaxSpecSamples) {
+                const size_t n = std::min(step.clean_pcm.size(), kMaxSpecSamples - spec_pcm_.size());
+                spec_pcm_.insert(spec_pcm_.end(), step.clean_pcm.begin(),
+                                 step.clean_pcm.begin() + static_cast<std::ptrdiff_t>(n));
+            }
+            if (step.vad_speaking) {
+                spec_voiced_ms_ += frame_ms;
+            }
+            const bool enough_streaming = (spec_voiced_ms_ >= min_speech_ms);
+            const bool enough_short_turn = (step.vad_ended && spec_voiced_ms_ >= 500U);
+            if ((enough_streaming || enough_short_turn) && step.snr_db >= kMinSpecSnrDb) {
+                spec_gen_ = (spec_gen_ == 0) ? 1 : (spec_gen_ + 1);
+                spec_state_ = SpeculativeState::kEvaluating;
+                cand.generation = spec_gen_;
+                cand.voiced_ms = spec_voiced_ms_;
+                cand.snr_db = step.snr_db;
+                cand.pcm_16k = spec_pcm_;
+                emit_candidate = true;
+            } else if (step.vad_ended) {
+                spec_pcm_.clear();
+                spec_voiced_ms_ = 0;
+                spec_state_ = SpeculativeState::kIdle;
+            }
+            break;
+        }
+
+        case SpeculativeState::kEvaluating:
+            // Keep buffering live audio while Core 1 evaluates voiceprint (~10-15ms) so zero words drop.
+            if (!step.clean_pcm.empty() && spec_pcm_.size() < kMaxSpecSamples) {
+                const size_t n = std::min(step.clean_pcm.size(), kMaxSpecSamples - spec_pcm_.size());
+                spec_pcm_.insert(spec_pcm_.end(), step.clean_pcm.begin(),
+                                 step.clean_pcm.begin() + static_cast<std::ptrdiff_t>(n));
+            }
+            break;
+        }
+    }
+
+    if (emit_candidate && on_vp_candidate_) {
+        on_vp_candidate_(cand);
+    }
 }
 
 void AudioEngine::SetTransportCodec(AudioTransportCodec codec) {
@@ -217,6 +473,10 @@ bool AudioEngine::ProcessCapturedPcm(const int16_t* mic_pcm, size_t samples, Afe
         clean_mic_rms_.store(clean_smooth, std::memory_order_relaxed);
     }
     HandleAfeStep(*step);
+    const uint32_t frame_ms =
+        static_cast<uint32_t>((samples * 1000U) / std::max<uint32_t>(cfg_.uplink_sample_rate, 1U));
+    UpdateCaptureSample(*step, frame_ms);
+    UpdateSpeculativeVoiceprint(*step, frame_ms);
     return true;
 }
 
@@ -385,7 +645,11 @@ void AudioEngine::RunInputLoop() {
             }
             continue;
         }
-        afe_.SetWakeDetectionEnabled(!uplink_enabled_.load(std::memory_order_relaxed) && !speaker_playing);
+        const bool wake_word_enabled =
+            (WakeMode() != AudioWakeMode::kVoiceprintDirect) &&
+            !uplink_enabled_.load(std::memory_order_relaxed) && !speaker_playing &&
+            !capture_active_.load(std::memory_order_relaxed);
+        afe_.SetWakeDetectionEnabled(wake_word_enabled);
         AfeStepResult step;
         if (!ProcessCapturedPcm(dma_rx_pcm_, read, &step)) {
             continue;
@@ -405,7 +669,10 @@ void AudioEngine::RunInputLoop() {
             uplink_pcm_buf.clear();
             continue;
         }
-        if (step.vad_started && !step.pre_roll_pcm.empty()) {
+        std::vector<int16_t> spec_flush;
+        if (TakePendingSpeculativePcm(&spec_flush)) {
+            uplink_pcm_buf.insert(uplink_pcm_buf.end(), spec_flush.begin(), spec_flush.end());
+        } else if (step.vad_started && !step.pre_roll_pcm.empty()) {
             uplink_pcm_buf.insert(uplink_pcm_buf.end(), step.pre_roll_pcm.begin(),
                                   step.pre_roll_pcm.end());
         }

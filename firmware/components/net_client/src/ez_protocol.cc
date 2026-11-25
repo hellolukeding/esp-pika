@@ -295,6 +295,146 @@ const char* EzOutputPreferenceWireName(EzOutputPreference pref) {
     }
 }
 
+const char* EzWakeModeWireName(EzWakeMode mode) {
+    switch (mode) {
+    case EzWakeMode::kWakeWordPlusVp: return "wake_word_plus_vp";
+    case EzWakeMode::kVoiceprintDirect: return "voiceprint_direct";
+    case EzWakeMode::kWakeWord:
+    default:
+        return "wake_word";
+    }
+}
+
+bool EzParseWakeMode(const std::string& wire, EzWakeMode* out) {
+    if (out == nullptr) {
+        return false;
+    }
+    if (wire == "wake_word") {
+        *out = EzWakeMode::kWakeWord;
+        return true;
+    }
+    if (wire == "wake_word_plus_vp") {
+        *out = EzWakeMode::kWakeWordPlusVp;
+        return true;
+    }
+    if (wire == "voiceprint_direct") {
+        *out = EzWakeMode::kVoiceprintDirect;
+        return true;
+    }
+    return false;
+}
+
+std::string EzWakeConfig::ToJson() const {
+    char num_buf[128] = {};
+    std::snprintf(num_buf, sizeof(num_buf),
+                  ",\"vp_threshold\":%.3f,\"min_speech_ms\":%lu,\"cooldown_ms\":%lu,\"vp_wake_chime\":%s",
+                  static_cast<double>(vp_threshold),
+                  static_cast<unsigned long>(min_speech_ms),
+                  static_cast<unsigned long>(cooldown_ms),
+                  vp_wake_chime ? "true" : "false");
+    std::string out = "{";
+    out += "\"mode\":\"" + std::string(EzWakeModeWireName(mode)) + "\"";
+    out += ",\"wake_word\":\"" + EscapeJsonString(wake_word) + "\"";
+    out += ",\"wake_pinyin\":\"" + EscapeJsonString(wake_pinyin) + "\"";
+    out += num_buf;
+    out.push_back('}');
+    return out;
+}
+
+bool EzWakeConfig::FromJson(const std::string& json_text) {
+    EzWakeConfig parsed = *this;
+    std::string mode_s;
+    if (ExtractJsonStringField(json_text, "mode", &mode_s)) {
+        EzWakeMode m = EzWakeMode::kWakeWord;
+        if (!EzParseWakeMode(mode_s, &m)) {
+            return false;
+        }
+        parsed.mode = m;
+    }
+    std::string word;
+    if (ExtractJsonStringField(json_text, "wake_word", &word) && !word.empty()) {
+        parsed.wake_word = word;
+    }
+    std::string pinyin;
+    if (ExtractJsonStringField(json_text, "wake_pinyin", &pinyin) && !pinyin.empty()) {
+        parsed.wake_pinyin = pinyin;
+    }
+    std::string th_raw;
+    if (ExtractJsonRawField(json_text, "vp_threshold", &th_raw) && !th_raw.empty()) {
+        char* end_ptr = nullptr;
+        const double th = std::strtod(th_raw.c_str(), &end_ptr);
+        if (end_ptr != th_raw.c_str() && th >= 0.4 && th <= 0.99) {
+            parsed.vp_threshold = std::clamp(static_cast<float>(th), 0.55f, 0.95f);
+        }
+    }
+    int64_t ms = 0;
+    if (ExtractJsonIntField(json_text, "min_speech_ms", &ms) && ms > 0) {
+        parsed.min_speech_ms = static_cast<uint32_t>(std::clamp<int64_t>(ms, 400, 1500));
+    }
+    if (ExtractJsonIntField(json_text, "cooldown_ms", &ms) && ms > 0) {
+        parsed.cooldown_ms = static_cast<uint32_t>(std::clamp<int64_t>(ms, 500, 5000));
+    }
+    bool chime = false;
+    if (ExtractJsonBoolField(json_text, "vp_wake_chime", &chime)) {
+        parsed.vp_wake_chime = chime;
+    }
+    *this = std::move(parsed);
+    return true;
+}
+
+#ifdef ESP_PLATFORM
+bool EzWakeConfig::LoadFromNvs() {
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open("ez_wake", NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return true;
+    }
+    if (err != ESP_OK) {
+        return false;
+    }
+    size_t required = 0;
+    err = nvs_get_str(handle, "cfg_json", nullptr, &required);
+    if (err == ESP_ERR_NVS_NOT_FOUND || required == 0 || required > 512) {
+        nvs_close(handle);
+        return true;
+    }
+    if (err != ESP_OK) {
+        nvs_close(handle);
+        return false;
+    }
+    std::string raw(required, '\0');
+    err = nvs_get_str(handle, "cfg_json", raw.data(), &required);
+    nvs_close(handle);
+    if (err != ESP_OK) {
+        return false;
+    }
+    if (!raw.empty() && raw.back() == '\0') {
+        raw.pop_back();
+    }
+    return FromJson(raw);
+}
+
+bool EzWakeConfig::SaveToNvs() const {
+    const std::string encoded = ToJson();
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open("ez_wake", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(kTag, "ez_wake nvs_open write failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    err = nvs_set_str(handle, "cfg_json", encoded.c_str());
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(kTag, "ez_wake nvs_commit failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    return true;
+}
+#endif
+
 bool EzParseOutputPreference(const std::string& wire, EzOutputPreference* out) {
     if (out == nullptr) {
         return false;
@@ -463,6 +603,8 @@ std::string EzBuildAuthHelloJson(const std::string& msg_id,
         p += ",\"zone\":\"" + EscapeJsonString(hardware->zone) + "\"";
         p += ",\"group_id\":\"" + EscapeJsonString(hardware->group_id) + "\"";
         p += ",\"vp_version\":" + std::string(vp_buf);
+        p += std::string(",\"multinet_ready\":") + (hardware->multinet_ready ? "true" : "false");
+        p += ",\"wake_config\":" + hardware->wake_config.ToJson();
         p += ",\"capabilities\":[";
         for (size_t i = 0; i < hardware->capabilities.size(); ++i) {
             if (i > 0) {
@@ -521,6 +663,24 @@ std::string EzBuildVoiceprintSyncAckJson(const std::string& msg_id,
     return WrapEnvelope(msg_id, "voiceprint_sync_ack", p);
 }
 
+std::string EzBuildWakeConfigAckJson(const std::string& msg_id,
+                                     const std::string& sync_id,
+                                     bool ok,
+                                     const EzWakeConfig* active_config,
+                                     const std::string& error) {
+    std::string p = "{";
+    p += "\"sync_id\":\"" + EscapeJsonString(sync_id) + "\"";
+    p += std::string(",\"ok\":") + (ok ? "true" : "false");
+    if (active_config != nullptr) {
+        p += ",\"active_config\":" + active_config->ToJson();
+    }
+    if (!error.empty()) {
+        p += ",\"error\":\"" + EscapeJsonString(error) + "\"";
+    }
+    p.push_back('}');
+    return WrapEnvelope(msg_id, "wake_config_ack", p);
+}
+
 std::string EzBuildSetOutputPreferenceJson(const std::string& msg_id, EzOutputPreference pref) {
     std::string p = "{\"output_preference\":\"";
     p += EzOutputPreferenceWireName(pref);
@@ -531,7 +691,11 @@ std::string EzBuildSetOutputPreferenceJson(const std::string& msg_id, EzOutputPr
 std::string EzBuildListenStartJson(const std::string& msg_id,
                                    const std::string& client_input_id,
                                    uint32_t stream_id,
-                                   EzOutputPreference output_preference) {
+                                   EzOutputPreference output_preference,
+                                   const std::string& wake_source,
+                                   const std::string& speaker_id,
+                                   int speaker_role,
+                                   float speaker_score) {
     char num_buf[24] = {};
     std::snprintf(num_buf, sizeof(num_buf), "%lu", static_cast<unsigned long>(stream_id));
     std::string p = "{";
@@ -539,6 +703,20 @@ std::string EzBuildListenStartJson(const std::string& msg_id,
     p += ",\"stream_id\":" + std::string(num_buf);
     p += ",\"format\":{\"encoding\":\"pcm_s16le\",\"sample_rate_hz\":16000,\"channels\":1,\"frame_duration_ms\":20}";
     p += ",\"output_preference\":\"" + std::string(EzOutputPreferenceWireName(output_preference)) + "\"";
+    if (!speaker_id.empty()) {
+        p += ",\"speaker_id\":\"" + EscapeJsonString(speaker_id) + "\"";
+    }
+    if (speaker_role >= 1 && speaker_role <= 3) {
+        p += ",\"speaker_role\":" + std::to_string(speaker_role);
+    }
+    if (speaker_score > 0.0f) {
+        char score_buf[24] = {};
+        std::snprintf(score_buf, sizeof(score_buf), "%.4f", static_cast<double>(speaker_score));
+        p += ",\"speaker_score\":" + std::string(score_buf);
+    }
+    if (!wake_source.empty()) {
+        p += ",\"wake_source\":\"" + EscapeJsonString(wake_source) + "\"";
+    }
     p.push_back('}');
     return WrapEnvelope(msg_id, "listen_start", p);
 }
@@ -708,6 +886,17 @@ bool EzParseInboundMessage(const std::string& json_text, EzInboundMessage* out) 
         out->type = EzInboundType::kVoiceprintSync;
         out->raw_payload = payload;
         return true;
+    }
+    if (type == "wake_config_sync") {
+        out->type = EzInboundType::kWakeConfigSync;
+        ExtractJsonStringField(payload, "sync_id", &out->wake_config_sync.sync_id);
+        int64_t cnt = 0;
+        if (ExtractJsonIntField(payload, "enrolled_speaker_count", &cnt) && cnt >= 0) {
+            out->wake_config_sync.enrolled_speaker_count = static_cast<uint32_t>(cnt);
+        }
+        std::string cfg_raw;
+        const std::string& cfg_src = ExtractJsonRawField(payload, "config", &cfg_raw) ? cfg_raw : payload;
+        return out->wake_config_sync.config.FromJson(cfg_src);
     }
     if (type == "ping") {
         out->type = EzInboundType::kPing;

@@ -94,7 +94,42 @@ std::string EzBuildPairingDirectCommitJson(const std::string& msg_id,
                                            const std::string& device_id,
                                            const std::string& signature_b64u);
 
-/// Hardware profile declared in authenticated `hello.hardware` for Phase 2 native console & MCP.
+/// Wake work mode configured via EZ Assistant native console and persisted in NVS `ez_wake`.
+enum class EzWakeMode {
+    kWakeWord = 0,
+    kWakeWordPlusVp,
+    kVoiceprintDirect,
+};
+
+const char* EzWakeModeWireName(EzWakeMode mode);
+bool EzParseWakeMode(const std::string& wire, EzWakeMode* out);
+
+struct EzWakeConfig {
+    EzWakeMode mode = EzWakeMode::kWakeWord;
+    std::string wake_word = "你好小元";
+    std::string wake_pinyin = "ni hao xiao yuan";
+    float vp_threshold = 0.78f;
+    uint32_t min_speech_ms = 700;
+    uint32_t cooldown_ms = 1500;
+    bool vp_wake_chime = false;
+
+    std::string ToJson() const;
+    bool FromJson(const std::string& json_text);
+
+#ifdef ESP_PLATFORM
+    bool LoadFromNvs();
+    bool SaveToNvs() const;
+#endif
+};
+
+/// Inbound `wake_config_sync` request sent over authenticated WSS `/device`.
+struct EzWakeConfigSyncRequest {
+    std::string sync_id;
+    EzWakeConfig config;
+    uint32_t enrolled_speaker_count = 0;
+};
+
+/// Hardware profile declared in authenticated `hello.hardware` for Phase 2 & 3 native console / MCP.
 struct EzHardwareProfile {
     bool enabled = false;
     std::string mac;
@@ -103,6 +138,8 @@ struct EzHardwareProfile {
     std::string zone;
     std::string group_id;
     uint64_t vp_version = 0;
+    bool multinet_ready = false;
+    EzWakeConfig wake_config;
     std::vector<std::string> capabilities;
 };
 
@@ -137,12 +174,22 @@ std::string EzBuildVoiceprintSyncAckJson(const std::string& msg_id,
                                          bool ok,
                                          const std::string& error = "");
 
+std::string EzBuildWakeConfigAckJson(const std::string& msg_id,
+                                     const std::string& sync_id,
+                                     bool ok,
+                                     const EzWakeConfig* active_config = nullptr,
+                                     const std::string& error = "");
+
 std::string EzBuildSetOutputPreferenceJson(const std::string& msg_id, EzOutputPreference pref);
 
 std::string EzBuildListenStartJson(const std::string& msg_id,
                                    const std::string& client_input_id,
                                    uint32_t stream_id,
-                                   EzOutputPreference output_preference);
+                                   EzOutputPreference output_preference,
+                                   const std::string& wake_source = "",
+                                   const std::string& speaker_id = "",
+                                   int speaker_role = 0,
+                                   float speaker_score = 0.0f);
 
 std::string EzBuildListenStopJson(const std::string& msg_id,
                                   uint32_t stream_id,
@@ -174,6 +221,7 @@ enum class EzInboundType {
     kSpeechStatusChanged,
     kDeviceCommand,
     kVoiceprintSync,
+    kWakeConfigSync,
     kPing,
     kError,
 };
@@ -205,6 +253,9 @@ struct EzInboundMessage {
 
     // voiceprint_sync (raw JSON object of `payload` for VoiceprintStore)
     std::string raw_payload;
+
+    // wake_config_sync
+    EzWakeConfigSyncRequest wake_config_sync;
 
     // state_changed / transcript / text_output
     std::string state;

@@ -47,6 +47,8 @@ struct WakeVoiceprintJob {
     float wake_score = 0.0f;
     float snr_db = 0.0f;
     std::vector<int16_t> pcm_16k;
+    std::string wake_source;
+    uint32_t generation = 0;
 };
 
 struct WakeVoiceprintOutcome {
@@ -81,6 +83,10 @@ public:
     /// Identifies the closest enrolled speaker using cosine similarity and 3-tier gating.
     bool Identify(const int16_t* pcm, size_t samples, VoiceprintMatch* out) const;
 
+    /// Dynamically updates the local acceptance cosine threshold (clamped to [0.55, 0.95]).
+    void SetAcceptThreshold(float threshold);
+    float AcceptThreshold() const { return accept_threshold_.load(std::memory_order_relaxed); }
+
     /// Starts the Core 1 async inference worker (internal DRAM stack safe for NVS access).
     bool StartAsyncWorker(AsyncOutcomeCallback cb);
     void StopAsyncWorker();
@@ -101,6 +107,7 @@ private:
 
     VoiceprintStore* store_ = nullptr;
     VoiceprintConfig cfg_;
+    std::atomic<float> accept_threshold_{0.85f};
     FbankExtractor fbank_;
     bool initialized_ = false;
 

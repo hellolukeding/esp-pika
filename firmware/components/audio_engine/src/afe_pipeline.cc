@@ -1,6 +1,7 @@
 #include "afe_pipeline.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 
@@ -239,6 +240,26 @@ bool AfePipeline::ProcessFrame(const int16_t* mic_pcm,
     out->snr_db = UpdateNoiseAndComputeSnr(mic_pcm, samples, &rms);
     const uint32_t frame_ms = static_cast<uint32_t>((samples * 1000U) / std::max<uint32_t>(cfg_.sample_rate, 1));
 
+    // Apply any queued runtime MultiNet7 wake-word update safely on Core 0 at frame boundary.
+    {
+        std::unique_lock<std::mutex> lock(wake_update_mu_);
+        if (has_pending_wake_update_) {
+            const std::string next_word = pending_wake_word_;
+            const std::string next_pinyin = pending_wake_pinyin_;
+            has_pending_wake_update_ = false;
+            lock.unlock();
+
+            std::string err;
+            const bool ok = ApplyWakePinyinNow(next_word, next_pinyin, &err);
+
+            lock.lock();
+            pending_wake_ok_ = ok;
+            pending_wake_error_ = std::move(err);
+            pending_wake_done_ = true;
+            wake_update_cv_.notify_all();
+        }
+    }
+
 #ifdef ESP_PLATFORM
     if (afe_handle_ != nullptr && afe_iface_ != nullptr) {
         auto* iface = static_cast<const esp_afe_sr_iface_t*>(afe_iface_);
@@ -372,6 +393,98 @@ bool AfePipeline::ProcessFrame(const int16_t* mic_pcm,
     }
     out->vad_speaking = speaking_;
     return true;
+}
+
+bool AfePipeline::IsMultiNetReady() const {
+#ifdef ESP_PLATFORM
+    return mn_handle_ != nullptr && mn_iface_ != nullptr;
+#else
+    return initialized_;
+#endif
+}
+
+bool AfePipeline::ApplyWakePinyinNow(const std::string& wake_word,
+                                     const std::string& wake_pinyin,
+                                     std::string* error_out) {
+    if (wake_pinyin.empty()) {
+        if (error_out != nullptr) {
+            *error_out = "wake_pinyin cannot be empty";
+        }
+        return false;
+    }
+#ifdef ESP_PLATFORM
+    if (mn_handle_ != nullptr && mn_iface_ != nullptr) {
+        auto* mn_iface = static_cast<const esp_mn_iface_t*>(mn_iface_);
+        auto* mn_data = static_cast<model_iface_data_t*>(mn_handle_);
+        esp_mn_commands_clear();
+        esp_mn_commands_add(1, wake_pinyin.c_str());
+        esp_mn_error_t* mn_err = esp_mn_commands_update();
+        if (mn_err != nullptr) {
+            ESP_LOGW(kTag, "MultiNet hot-update failed for pinyin='%s' (%d errors); rolling back to '%s'",
+                     wake_pinyin.c_str(), static_cast<int>(mn_err->num), cfg_.wake_pinyin.c_str());
+            esp_mn_commands_clear();
+            esp_mn_commands_add(1, cfg_.wake_pinyin.c_str());
+            esp_mn_commands_update();
+            mn_iface->clean(mn_data);
+            mn_carry_.clear();
+            mn_hangover_chunks_ = 0;
+            if (error_out != nullptr) {
+                *error_out = "MultiNet7 无法识别该唤醒词拼音，请检查是否为合法无声调中文拼音";
+            }
+            return false;
+        }
+        mn_iface->clean(mn_data);
+        mn_carry_.clear();
+        mn_hangover_chunks_ = 0;
+        cfg_.wake_word = wake_word.empty() ? cfg_.wake_word : wake_word;
+        cfg_.wake_pinyin = wake_pinyin;
+        ESP_LOGI(kTag, "MultiNet wake word hot-updated: word='%s' pinyin='%s'",
+                 cfg_.wake_word.c_str(), cfg_.wake_pinyin.c_str());
+        return true;
+    }
+#endif
+    cfg_.wake_word = wake_word.empty() ? cfg_.wake_word : wake_word;
+    cfg_.wake_pinyin = wake_pinyin;
+    return true;
+}
+
+bool AfePipeline::UpdateWakePinyin(const std::string& wake_word,
+                                   const std::string& wake_pinyin,
+                                   bool core0_active,
+                                   std::string* error_out) {
+    if (!initialized_) {
+        if (error_out != nullptr) {
+            *error_out = "AFE pipeline not initialized";
+        }
+        return false;
+    }
+#ifdef ESP_PLATFORM
+    if (core0_active && mn_handle_ != nullptr && mn_iface_ != nullptr) {
+        std::unique_lock<std::mutex> lock(wake_update_mu_);
+        pending_wake_word_ = wake_word;
+        pending_wake_pinyin_ = wake_pinyin;
+        pending_wake_done_ = false;
+        pending_wake_ok_ = false;
+        pending_wake_error_.clear();
+        has_pending_wake_update_ = true;
+        const bool finished = wake_update_cv_.wait_for(
+            lock, std::chrono::milliseconds(1500), [this]() { return pending_wake_done_; });
+        if (!finished) {
+            has_pending_wake_update_ = false;
+            if (error_out != nullptr) {
+                *error_out = "等待音频核心应用唤醒词超时";
+            }
+            return false;
+        }
+        if (error_out != nullptr) {
+            *error_out = pending_wake_error_;
+        }
+        return pending_wake_ok_;
+    }
+#else
+    (void)core0_active;
+#endif
+    return ApplyWakePinyinNow(wake_word, wake_pinyin, error_out);
 }
 
 bool AfePipeline::TriggerManualWake(float wake_score, float snr_db, AfeStepResult* out) {

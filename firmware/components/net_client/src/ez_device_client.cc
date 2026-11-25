@@ -373,6 +373,14 @@ bool EzDeviceClient::SendBinary(const uint8_t* data, size_t len) {
 }
 
 bool EzDeviceClient::StartListen(uint32_t* out_stream_id) {
+    return StartListenWithContext(out_stream_id, "wake_word", "", 0, 0.0f);
+}
+
+bool EzDeviceClient::StartListenWithContext(uint32_t* out_stream_id,
+                                            const std::string& wake_source,
+                                            const std::string& speaker_id,
+                                            int speaker_role,
+                                            float speaker_score) {
     if (out_stream_id == nullptr || !IsOnline()) {
         return false;
     }
@@ -391,7 +399,8 @@ bool EzDeviceClient::StartListen(uint32_t* out_stream_id) {
     const EzOutputPreference pref =
         tts_ready_.load(std::memory_order_acquire) ? EzOutputPreference::kTextAndAudio
                                                    : EzOutputPreference::kText;
-    if (!SendJson(EzBuildListenStartJson(NextMessageId(), input_id, sid, pref))) {
+    if (!SendJson(EzBuildListenStartJson(NextMessageId(), input_id, sid, pref, wake_source,
+                                         speaker_id, speaker_role, speaker_score))) {
         return false;
     }
     *out_stream_id = sid;
@@ -455,9 +464,25 @@ bool EzDeviceClient::SendVoiceprintSyncAck(uint64_t vp_version,
     return SendJson(EzBuildVoiceprintSyncAckJson(NextMessageId(), vp_version, count, ok, error));
 }
 
+bool EzDeviceClient::SendWakeConfigAck(const std::string& sync_id,
+                                       bool ok,
+                                       const EzWakeConfig* active_config,
+                                       const std::string& error) {
+    if (!IsOnline()) {
+        return false;
+    }
+    return SendJson(EzBuildWakeConfigAckJson(NextMessageId(), sync_id, ok, active_config, error));
+}
+
 void EzDeviceClient::SetVoiceprintVersion(uint64_t vp_version) {
     std::lock_guard<std::mutex> lock(mu_);
     cfg_.hardware.vp_version = vp_version;
+}
+
+void EzDeviceClient::SetWakeConfig(const EzWakeConfig& wake_config, bool multinet_ready) {
+    std::lock_guard<std::mutex> lock(mu_);
+    cfg_.hardware.wake_config = wake_config;
+    cfg_.hardware.multinet_ready = multinet_ready;
 }
 
 void EzDeviceClient::HandleInboundEnvelope(const std::string& json_text) {
@@ -619,6 +644,15 @@ void EzDeviceClient::HandleInboundEnvelope(const std::string& json_text) {
             pending_vp_syncs_.push_back(std::move(msg.raw_payload));
         } else if (!pending_vp_syncs_.empty()) {
             pending_vp_syncs_.back() = std::move(msg.raw_payload);
+        }
+        break;
+    }
+    case EzInboundType::kWakeConfigSync: {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (pending_wake_syncs_.size() < 4) {
+            pending_wake_syncs_.push_back(std::move(msg.wake_config_sync));
+        } else if (!pending_wake_syncs_.empty()) {
+            pending_wake_syncs_.back() = std::move(msg.wake_config_sync);
         }
         break;
     }
@@ -1025,11 +1059,12 @@ void EzDeviceClient::WebSocketEventHandler(void* arg,
 
 void EzDeviceClient::TickFast(uint32_t dt_ms) {
     (void)dt_ms;
-    // Drain inbound WSS hardware commands and voiceprint syncs on Core 1's internal-DRAM stack
-    // so NVS/Flash writes and HAL calls stay safe (AGENTS.md §3.1).
+    // Drain inbound WSS hardware commands, voiceprint syncs, and wake config syncs on Core 1's
+    // internal-DRAM stack so NVS/Flash writes and HAL calls stay safe (AGENTS.md §3.1).
     {
         std::vector<EzDeviceCommandRequest> cmds;
         std::vector<std::string> vp_syncs;
+        std::vector<EzWakeConfigSyncRequest> wake_syncs;
         {
             std::lock_guard<std::mutex> lock(mu_);
             if (!pending_commands_.empty()) {
@@ -1037,6 +1072,9 @@ void EzDeviceClient::TickFast(uint32_t dt_ms) {
             }
             if (!pending_vp_syncs_.empty()) {
                 vp_syncs.swap(pending_vp_syncs_);
+            }
+            if (!pending_wake_syncs_.empty()) {
+                wake_syncs.swap(pending_wake_syncs_);
             }
         }
         if (callbacks_.on_device_command) {
@@ -1047,6 +1085,11 @@ void EzDeviceClient::TickFast(uint32_t dt_ms) {
         if (callbacks_.on_voiceprint_sync) {
             for (const auto& raw_sync : vp_syncs) {
                 callbacks_.on_voiceprint_sync(raw_sync);
+            }
+        }
+        if (callbacks_.on_wake_config_sync) {
+            for (const auto& ws : wake_syncs) {
+                callbacks_.on_wake_config_sync(ws);
             }
         }
     }

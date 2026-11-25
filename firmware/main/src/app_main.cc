@@ -1,6 +1,8 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -32,7 +34,17 @@
 namespace {
 
 constexpr const char* kTag = "app_main";
-constexpr const char* kFirmwareVersion = "0.4.0-direct";
+constexpr const char* kFirmwareVersion = "0.5.0-direct";
+
+esp_pika::AudioWakeMode ToAudioWakeMode(esp_pika::EzWakeMode mode) {
+    switch (mode) {
+    case esp_pika::EzWakeMode::kWakeWordPlusVp: return esp_pika::AudioWakeMode::kWakeWordPlusVp;
+    case esp_pika::EzWakeMode::kVoiceprintDirect: return esp_pika::AudioWakeMode::kVoiceprintDirect;
+    case esp_pika::EzWakeMode::kWakeWord:
+    default:
+        return esp_pika::AudioWakeMode::kWakeWord;
+    }
+}
 
 std::string BuildDefaultMosaicoName(const std::string& mac) {
     std::string hex;
@@ -126,7 +138,14 @@ public:
                  factory_mac.c_str(), display_name.c_str());
 
         vp_store_.LoadFromNvs();
-        if (!vp_engine_.Init(&vp_store_)) {
+        wake_cfg_.LoadFromNvs();
+        if (vp_store_.Count() == 0 && wake_cfg_.mode != esp_pika::EzWakeMode::kWakeWord) {
+            wake_cfg_.mode = esp_pika::EzWakeMode::kWakeWord;
+            wake_cfg_.SaveToNvs();
+        }
+        esp_pika::VoiceprintConfig vp_cfg;
+        vp_cfg.accept_threshold = wake_cfg_.vp_threshold;
+        if (!vp_engine_.Init(&vp_store_, vp_cfg)) {
             ESP_LOGE(kTag, "voiceprint engine init failed");
             return false;
         }
@@ -137,11 +156,15 @@ public:
         esp_pika::AudioEngineConfig audio_cfg;
         audio_cfg.transport_codec = ez_direct_mode_ ? esp_pika::AudioTransportCodec::kPcm16_20ms
                                                     : esp_pika::AudioTransportCodec::kOpus60ms;
+        audio_cfg.afe.wake_word = wake_cfg_.wake_word;
+        audio_cfg.afe.wake_pinyin = wake_cfg_.wake_pinyin;
         if (!audio_.Init(board_->Audio(), audio_cfg)) {
             ESP_LOGE(kTag, "audio engine init failed");
             return false;
         }
         audio_.SetTransportCodec(audio_cfg.transport_codec);
+        audio_.SetWakeMode(ToAudioWakeMode(wake_cfg_.mode), wake_cfg_.min_speech_ms,
+                           wake_cfg_.cooldown_ms);
         executor_ = std::make_unique<esp_pika::LocalExecutor>(board_.get(), &net_, &vp_store_);
         hw_ready_ = true;
 
@@ -158,6 +181,8 @@ public:
             ez_cfg.hardware.zone = kDefaultZone;
             ez_cfg.hardware.group_id = kDefaultGroupId;
             ez_cfg.hardware.vp_version = vp_store_.Version();
+            ez_cfg.hardware.multinet_ready = audio_.IsMultiNetReady();
+            ez_cfg.hardware.wake_config = wake_cfg_;
             ez_cfg.hardware.capabilities = {
                 "device.display_show",
                 "device.audio_set_volume",
@@ -166,6 +191,7 @@ public:
                 "device.actuator_set",
                 "device.voiceprint_list",
                 "device.voiceprint_delete",
+                "device.voiceprint_capture",
             };
 
             esp_pika::EzDeviceCallbacks ez_cbs;
@@ -208,6 +234,9 @@ public:
             ez_cbs.on_voiceprint_sync = [this](const std::string& raw_payload) {
                 HandleEzVoiceprintSync(raw_payload);
             };
+            ez_cbs.on_wake_config_sync = [this](const esp_pika::EzWakeConfigSyncRequest& sync) {
+                HandleEzWakeConfigSync(sync);
+            };
             ez_client_.Init(ez_cfg, std::move(ez_cbs));
             ui_.SetEzUnpairCallback([this]() { ez_client_.ResetPairing(); });
         }
@@ -239,7 +268,10 @@ public:
         audio_.Start(
             nullptr,
             [this](const esp_pika::WakeEvent& evt) { HandleWakeEvent(evt); },
-            [this](bool speaking, float snr_db) { HandleVadState(speaking, snr_db); });
+            [this](bool speaking, float snr_db) { HandleVadState(speaking, snr_db); },
+            [this](const esp_pika::VoiceprintCandidateEvent& cand) {
+                HandleVoiceprintCandidate(cand);
+            });
         audio_started_ = true;
 
         net_cfg_ = {};
@@ -663,62 +695,130 @@ private:
         }
     }
 
+    bool StartDirectListenTurn(const std::string& wake_source,
+                               const std::string& speaker_id,
+                               int speaker_role,
+                               float speaker_score,
+                               bool play_chime,
+                               uint32_t accept_spec_gen) {
+        if (!ez_client_.IsOnline()) {
+            ui_.ShowMessage(ez_client_.IsPaired() ? "sleep" : "curious",
+                            ez_client_.IsPaired() ? "EZ ASSISTANT OFFLINE"
+                                                  : "CONNECT IN EZ ASSISTANT");
+            return false;
+        }
+        if (!ez_client_.IsAsrReady()) {
+            ui_.ShowMessage("surprised", "ASR NOT CONFIGURED");
+            return false;
+        }
+        std::string active_out;
+        uint32_t active_sid = 0;
+        {
+            std::lock_guard<std::mutex> lock(ez_mu_);
+            active_out = std::move(ez_active_playback_output_id_);
+            active_sid = ez_active_playback_stream_id_;
+            ez_active_playback_output_id_.clear();
+            ez_active_playback_stream_id_ = 0;
+        }
+        if (active_sid != 0 && !active_out.empty()) {
+            ez_client_.CancelPlayback(active_out, active_sid);
+        }
+        audio_.ClearDownlinkQueue();
+        if (accept_spec_gen == 0) {
+            audio_.ClearQueues();
+        }
+        if (play_chime) {
+            audio_.PlayWakeChime();
+        }
+
+        uint32_t new_sid = 0;
+        if (!ez_client_.StartListenWithContext(&new_sid, wake_source, speaker_id, speaker_role,
+                                               speaker_score)) {
+            ui_.ShowMessage("surprised", "LISTEN START FAILED");
+            return false;
+        }
+        if (accept_spec_gen > 0) {
+            if (!audio_.AcceptSpeculativeWake(accept_spec_gen)) {
+                ez_client_.CancelListen(new_sid);
+                return false;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(speech_mu_);
+            speech_started_ = true;
+            heard_speech_ = (accept_spec_gen > 0);
+            speech_active_ms_ = (accept_spec_gen > 0) ? wake_cfg_.min_speech_ms : 0;
+            silence_after_speech_ms_ = 0;
+            turn_sent_frames_ = 0;
+            logged_first_rx_audio_ = false;
+            ez_uplink_stream_id_ = new_sid;
+            ez_uplink_seq_ = 0;
+            uplink_started_ms_ = NowMillis();
+        }
+        if (accept_spec_gen == 0) {
+            audio_.SetUplinkEnabled(true);
+        }
+        {
+            std::lock_guard<std::mutex> lock(state_mu_);
+            state_.OnLocalWakeTriggered();
+            state_.OnWakeAccept();
+            SyncUiEmotionLocked();
+        }
+        return true;
+    }
+
+    void HandleVoiceprintCandidate(const esp_pika::VoiceprintCandidateEvent& cand) {
+        if (!ez_direct_mode_ || vp_store_.Count() == 0) {
+            audio_.RejectSpeculativeWake(cand.generation);
+            return;
+        }
+        esp_pika::WakeVoiceprintJob job;
+        job.wake_word = "voiceprint_direct";
+        job.wake_source = "voiceprint_direct";
+        job.generation = cand.generation;
+        job.wake_score = 1.0f;
+        job.snr_db = cand.snr_db;
+        job.pcm_16k = cand.pcm_16k;
+        if (!vp_engine_.SubmitWakeUtteranceAsync(std::move(job))) {
+            audio_.RejectSpeculativeWake(cand.generation);
+        }
+    }
+
     void HandleWakeEvent(const esp_pika::WakeEvent& evt) {
         ESP_LOGI(kTag, "wake triggered word=%s score=%.2f snr=%.1f",
                  evt.wake_word.c_str(),
                  static_cast<double>(evt.wake_score),
                  static_cast<double>(evt.snr_db));
         if (ez_direct_mode_) {
-            if (!ez_client_.IsOnline()) {
-                ui_.ShowMessage(ez_client_.IsPaired() ? "sleep" : "curious",
-                                ez_client_.IsPaired() ? "EZ ASSISTANT OFFLINE"
-                                                      : "CONNECT IN EZ ASSISTANT");
+            esp_pika::EzWakeConfig cur_wake;
+            {
+                std::lock_guard<std::mutex> lock(wake_mu_);
+                cur_wake = wake_cfg_;
+            }
+            if (cur_wake.mode == esp_pika::EzWakeMode::kWakeWordPlusVp &&
+                vp_store_.Count() > 0 && !evt.wake_pcm_16k.empty()) {
+                esp_pika::WakeVoiceprintJob job;
+                job.wake_word = evt.wake_word;
+                job.wake_source = "wake_word_plus_vp";
+                job.wake_score = evt.wake_score;
+                job.snr_db = evt.snr_db;
+                job.pcm_16k = evt.wake_pcm_16k;
+                vp_engine_.SubmitWakeUtteranceAsync(std::move(job));
                 return;
             }
-            if (!ez_client_.IsAsrReady()) {
-                ui_.ShowMessage("surprised", "ASR NOT CONFIGURED");
-                return;
+            std::string spk_id;
+            int spk_role = 0;
+            float spk_score = 0.0f;
+            if (vp_store_.Count() > 0 && !evt.wake_pcm_16k.empty()) {
+                esp_pika::VoiceprintMatch match;
+                if (vp_engine_.Identify(evt.wake_pcm_16k.data(), evt.wake_pcm_16k.size(), &match) &&
+                    match.identified) {
+                    spk_id = match.speaker_id;
+                    spk_role = static_cast<int>(match.role);
+                    spk_score = match.score;
+                }
             }
-            std::string active_out;
-            uint32_t active_sid = 0;
-            {
-                std::lock_guard<std::mutex> lock(ez_mu_);
-                active_out = std::move(ez_active_playback_output_id_);
-                active_sid = ez_active_playback_stream_id_;
-                ez_active_playback_output_id_.clear();
-                ez_active_playback_stream_id_ = 0;
-            }
-            if (active_sid != 0 && !active_out.empty()) {
-                ez_client_.CancelPlayback(active_out, active_sid);
-            }
-            audio_.ClearDownlinkQueue();
-            audio_.ClearQueues();
-            audio_.PlayWakeChime();
-
-            uint32_t new_sid = 0;
-            if (!ez_client_.StartListen(&new_sid)) {
-                ui_.ShowMessage("surprised", "LISTEN START FAILED");
-                return;
-            }
-            {
-                std::lock_guard<std::mutex> lock(speech_mu_);
-                speech_started_ = true;
-                heard_speech_ = false;
-                speech_active_ms_ = 0;
-                silence_after_speech_ms_ = 0;
-                turn_sent_frames_ = 0;
-                logged_first_rx_audio_ = false;
-                ez_uplink_stream_id_ = new_sid;
-                ez_uplink_seq_ = 0;
-                uplink_started_ms_ = NowMillis();
-            }
-            audio_.SetUplinkEnabled(true);
-            {
-                std::lock_guard<std::mutex> lock(state_mu_);
-                state_.OnLocalWakeTriggered();
-                state_.OnWakeAccept();
-                SyncUiEmotionLocked();
-            }
+            StartDirectListenTurn("wake_word", spk_id, spk_role, spk_score, true, 0);
             return;
         }
         esp_pika::WakeDetectedPayload wake;
@@ -758,11 +858,46 @@ private:
     }
 
     void HandleVoiceprintOutcome(const esp_pika::WakeVoiceprintOutcome& outcome) {
-        ESP_LOGI(kTag, "voiceprint result speaker=%s role=%s score=%.3f latency=%lldus",
+        ESP_LOGI(kTag, "voiceprint result src=%s speaker=%s role=%s score=%.3f latency=%lldus",
+                 outcome.job.wake_source.empty() ? "gateway" : outcome.job.wake_source.c_str(),
                  outcome.match.speaker_id.c_str(),
                  esp_pika::SpeakerRoleName(outcome.match.role),
                  static_cast<double>(outcome.match.score),
                  static_cast<long long>(outcome.inference_us));
+        if (ez_direct_mode_) {
+            esp_pika::EzWakeConfig cur_wake;
+            {
+                std::lock_guard<std::mutex> lock(wake_mu_);
+                cur_wake = wake_cfg_;
+            }
+            const bool verified =
+                outcome.match.identified && (outcome.match.score >= cur_wake.vp_threshold);
+            if (outcome.job.wake_source == "voiceprint_direct") {
+                if (verified) {
+                    const bool started = StartDirectListenTurn(
+                        "voiceprint_direct", outcome.match.speaker_id,
+                        static_cast<int>(outcome.match.role), outcome.match.score,
+                        cur_wake.vp_wake_chime, outcome.job.generation);
+                    if (!started) {
+                        audio_.RejectSpeculativeWake(outcome.job.generation);
+                    }
+                } else {
+                    audio_.RejectSpeculativeWake(outcome.job.generation);
+                }
+                return;
+            }
+            if (outcome.job.wake_source == "wake_word_plus_vp") {
+                if (verified) {
+                    StartDirectListenTurn("wake_word_plus_vp", outcome.match.speaker_id,
+                                          static_cast<int>(outcome.match.role),
+                                          outcome.match.score, true, 0);
+                } else {
+                    ui_.ShowMessage("curious", "声纹未匹配");
+                }
+                return;
+            }
+            return;
+        }
         const bool uplink = IsUplinkActive();
         bool send_start = false;
         {
@@ -1032,6 +1167,70 @@ private:
             return;
         }
 
+        if (cmd.capability == "device.voiceprint_capture" || cmd.capability == "voiceprint.capture") {
+            int64_t duration_ms = 3000;
+            int64_t step = 1;
+            int64_t total = 3;
+            esp_pika::ExtractJsonIntField(cmd.params_json, "duration_ms", &duration_ms);
+            esp_pika::ExtractJsonIntField(cmd.params_json, "step", &step);
+            esp_pika::ExtractJsonIntField(cmd.params_json, "total", &total);
+            char prompt_buf[64] = {};
+            std::snprintf(prompt_buf, sizeof(prompt_buf), "录声纹 %lld/%lld 请说话",
+                          static_cast<long long>(step), static_cast<long long>(total));
+            ui_.ShowMessage("listening", prompt_buf);
+
+            std::vector<int16_t> pcm;
+            uint32_t voiced_ms = 0;
+            float snr_db = 0.0f;
+            if (!audio_.CaptureSpeechSample(static_cast<uint32_t>(duration_ms), &pcm, &voiced_ms,
+                                            &snr_db) ||
+                pcm.size() < 4000 || voiced_ms < 450) {
+                ui_.ShowMessage("curious", "声音太小，请重试");
+                ez_client_.SendDeviceCommandResult(
+                    cmd.command_id, false, "", "", "AUDIO_TOO_SHORT",
+                    "未采集到足够有效人声（至少 0.5 秒），请靠近 Mosaico 重新朗读。");
+                return;
+            }
+            std::vector<float> emb;
+            if (!vp_engine_.ExtractEmbedding(pcm.data(), pcm.size(), &emb) || emb.empty()) {
+                ui_.ShowMessage("curious", "声纹提取失败");
+                ez_client_.SendDeviceCommandResult(cmd.command_id, false, "", "",
+                                                   "EMBEDDING_FAILED", "端侧声纹特征提取失败");
+                return;
+            }
+            double sum_sq = 0.0;
+            for (int16_t s : pcm) {
+                const double v = static_cast<double>(s) / 32768.0;
+                sum_sq += v * v;
+            }
+            const float rms = static_cast<float>(std::sqrt(sum_sq / static_cast<double>(pcm.size())));
+            const uint32_t actual_ms = static_cast<uint32_t>((pcm.size() * 1000U) / 16000U);
+
+            std::string json;
+            json.reserve(emb.size() * 12 + 128);
+            char hdr[160] = {};
+            std::snprintf(hdr, sizeof(hdr),
+                          "{\"ok\":true,\"duration_ms\":%lu,\"voiced_ms\":%lu,\"snr_db\":%.2f,"
+                          "\"rms\":%.4f,\"embedding\":[",
+                          static_cast<unsigned long>(actual_ms),
+                          static_cast<unsigned long>(voiced_ms),
+                          static_cast<double>(snr_db),
+                          static_cast<double>(rms));
+            json += hdr;
+            for (size_t i = 0; i < emb.size(); ++i) {
+                if (i > 0) {
+                    json.push_back(',');
+                }
+                char fbuf[20] = {};
+                std::snprintf(fbuf, sizeof(fbuf), "%.6f", static_cast<double>(emb[i]));
+                json += fbuf;
+            }
+            json += "]}";
+            ui_.ShowMessage("happy", "声纹采集完成");
+            ez_client_.SendDeviceCommandResult(cmd.command_id, true, json);
+            return;
+        }
+
         if (!executor_) {
             ez_client_.SendDeviceCommandResult(cmd.command_id, false, "", "",
                                                "EXECUTOR_UNAVAILABLE",
@@ -1069,6 +1268,25 @@ private:
         }
         const bool saved = vp_store_.SaveToNvs();
         ez_client_.SetVoiceprintVersion(vp_store_.Version());
+        if (vp_store_.Count() == 0) {
+            bool fell_back = false;
+            esp_pika::EzWakeConfig fallback_cfg;
+            {
+                std::lock_guard<std::mutex> lock(wake_mu_);
+                if (wake_cfg_.mode != esp_pika::EzWakeMode::kWakeWord) {
+                    wake_cfg_.mode = esp_pika::EzWakeMode::kWakeWord;
+                    fallback_cfg = wake_cfg_;
+                    fell_back = true;
+                }
+            }
+            if (fell_back) {
+                audio_.SetWakeMode(esp_pika::AudioWakeMode::kWakeWord, fallback_cfg.min_speech_ms,
+                                   fallback_cfg.cooldown_ms);
+                fallback_cfg.SaveToNvs();
+                ez_client_.SetWakeConfig(fallback_cfg, audio_.IsMultiNetReady());
+                ESP_LOGW(kTag, "voiceprints empty; auto-fallback to wake_word mode");
+            }
+        }
         ESP_LOGI(kTag, "ez voiceprint_sync applied vp_version=%llu count=%zu saved=%d",
                  static_cast<unsigned long long>(vp_store_.Version()),
                  vp_store_.Count(),
@@ -1076,6 +1294,41 @@ private:
         ez_client_.SendVoiceprintSyncAck(vp_store_.Version(),
                                          static_cast<uint32_t>(vp_store_.Count()),
                                          saved, saved ? "" : "nvs_save_failed");
+    }
+
+    void HandleEzWakeConfigSync(const esp_pika::EzWakeConfigSyncRequest& sync) {
+        esp_pika::EzWakeConfig next = sync.config;
+        if (vp_store_.Count() == 0 && sync.enrolled_speaker_count == 0 &&
+            next.mode != esp_pika::EzWakeMode::kWakeWord) {
+            next.mode = esp_pika::EzWakeMode::kWakeWord;
+        }
+        esp_pika::EzWakeConfig prev;
+        {
+            std::lock_guard<std::mutex> lock(wake_mu_);
+            prev = wake_cfg_;
+        }
+        if (next.wake_pinyin != prev.wake_pinyin || next.wake_word != prev.wake_word) {
+            std::string err;
+            if (!audio_.UpdateWakePinyin(next.wake_word, next.wake_pinyin, &err)) {
+                ESP_LOGW(kTag, "MultiNet hot-update rejected pinyin='%s': %s",
+                         next.wake_pinyin.c_str(), err.c_str());
+                ez_client_.SendWakeConfigAck(sync.sync_id, false, &prev, err);
+                return;
+            }
+        }
+        vp_engine_.SetAcceptThreshold(next.vp_threshold);
+        audio_.SetWakeMode(ToAudioWakeMode(next.mode), next.min_speech_ms, next.cooldown_ms);
+        {
+            std::lock_guard<std::mutex> lock(wake_mu_);
+            wake_cfg_ = next;
+        }
+        const bool saved = next.SaveToNvs();
+        ez_client_.SetWakeConfig(next, audio_.IsMultiNetReady());
+        ESP_LOGI(kTag, "ez wake_config_sync applied mode=%s word='%s' pinyin='%s' th=%.2f saved=%d",
+                 esp_pika::EzWakeModeWireName(next.mode), next.wake_word.c_str(),
+                 next.wake_pinyin.c_str(), static_cast<double>(next.vp_threshold),
+                 saved ? 1 : 0);
+        ez_client_.SendWakeConfigAck(sync.sync_id, saved, &next, saved ? "" : "nvs_save_failed");
     }
 
     void HandleConnectionState(bool connected) {
@@ -1258,6 +1511,9 @@ private:
     mutable std::mutex ez_mu_;
     std::string ez_active_playback_output_id_;
     uint32_t ez_active_playback_stream_id_ = 0;
+
+    mutable std::mutex wake_mu_;
+    esp_pika::EzWakeConfig wake_cfg_;
 
     mutable std::mutex state_mu_;
     esp_pika::AppStateMachine state_;

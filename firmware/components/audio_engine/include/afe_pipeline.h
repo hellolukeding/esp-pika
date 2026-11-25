@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -91,8 +92,19 @@ public:
     bool IsSpeaking() const { return speaking_; }
     void SetWakeDetectionEnabled(bool enabled) { wake_enabled_.store(enabled, std::memory_order_relaxed); }
 
+    /// Hot-updates the active MultiNet7 wake word & pinyin at runtime without reboot.
+    /// When `core0_active` is true on ESP32, applies safely inside Core 0's ProcessFrame().
+    bool UpdateWakePinyin(const std::string& wake_word,
+                          const std::string& wake_pinyin,
+                          bool core0_active,
+                          std::string* error_out = nullptr);
+    bool IsMultiNetReady() const;
+
 private:
     float UpdateNoiseAndComputeSnr(const int16_t* pcm, size_t samples, float* out_rms);
+    bool ApplyWakePinyinNow(const std::string& wake_word,
+                            const std::string& wake_pinyin,
+                            std::string* error_out);
 
     AfePipelineConfig cfg_;
     std::unique_ptr<PcmPreRollBuffer> pre_roll_;
@@ -102,6 +114,15 @@ private:
     uint32_t hangover_elapsed_ms_ = 0;
     float noise_floor_rms_ = 80.0f;
     float last_snr_db_ = 0.0f;
+
+    std::mutex wake_update_mu_;
+    std::condition_variable wake_update_cv_;
+    bool has_pending_wake_update_ = false;
+    bool pending_wake_done_ = false;
+    bool pending_wake_ok_ = false;
+    std::string pending_wake_word_;
+    std::string pending_wake_pinyin_;
+    std::string pending_wake_error_;
 
 #ifdef ESP_PLATFORM
     void* afe_handle_ = nullptr;

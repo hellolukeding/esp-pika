@@ -339,7 +339,7 @@ void TestFbankAndVoiceprintEngine() {
         assert(out.match.speaker_id == "spk_luke");
         assert(out.inference_us >= 0);
     }));
-    assert(engine.SubmitWakeUtteranceAsync({"hi_esp", 0.95f, 20.0f, query_a}));
+    assert(engine.SubmitWakeUtteranceAsync({"hi_esp", 0.95f, 20.0f, query_a, "", 0}));
     assert(engine.ProcessOnePendingForTest());
     assert(got_async);
     engine.StopAsyncWorker();
@@ -1072,6 +1072,126 @@ void TestEzProtocolAndUiPairingFlow() {
     assert(vol_res.ok && mosaico_board->Audio()->Volume() == 66);
 }
 
+void TestPhase3WakeConfigMultiTemplateAndSpeculativeBuffer() {
+    // 1. EzWakeConfig JSON round-trip, hello.hardware.wake_config, wake_config_sync, listen_start
+    EzWakeConfig cfg;
+    assert(cfg.mode == EzWakeMode::kWakeWord);
+    assert(cfg.wake_word == "你好小元");
+    assert(cfg.wake_pinyin == "ni hao xiao yuan");
+
+    EzInboundMessage ws_msg;
+    assert(EzParseInboundMessage(
+        "{\"protocol_major\":1,\"protocol_minor\":0,\"message_id\":\"m-wk-1\","
+        "\"type\":\"wake_config_sync\","
+        "\"payload\":{\"sync_id\":\"wake-abc\",\"enrolled_speaker_count\":1,"
+        "\"config\":{\"mode\":\"voiceprint_direct\",\"wake_word\":\"小元同学\","
+        "\"wake_pinyin\":\"xiao yuan tong xue\",\"vp_threshold\":0.75,"
+        "\"min_speech_ms\":650,\"cooldown_ms\":1200,\"vp_wake_chime\":false}}}",
+        &ws_msg));
+    assert(ws_msg.type == EzInboundType::kWakeConfigSync);
+    assert(ws_msg.wake_config_sync.sync_id == "wake-abc");
+    assert(ws_msg.wake_config_sync.config.mode == EzWakeMode::kVoiceprintDirect);
+    assert(ws_msg.wake_config_sync.config.wake_pinyin == "xiao yuan tong xue");
+    assert(ws_msg.wake_config_sync.config.min_speech_ms == 650);
+
+    const std::string ack = EzBuildWakeConfigAckJson("m-wa-1", "wake-abc", true,
+                                                     &ws_msg.wake_config_sync.config);
+    assert(ack.find("\"type\":\"wake_config_ack\"") != std::string::npos);
+    assert(ack.find("\"sync_id\":\"wake-abc\"") != std::string::npos);
+    assert(ack.find("\"mode\":\"voiceprint_direct\"") != std::string::npos);
+
+    const std::string ls = EzBuildListenStartJson("m-ls-1", "in-1", 9, EzOutputPreference::kText,
+                                                  "voiceprint_direct", "spk_luke", 1, 0.91f);
+    assert(ls.find("\"wake_source\":\"voiceprint_direct\"") != std::string::npos);
+    assert(ls.find("\"speaker_id\":\"spk_luke\"") != std::string::npos);
+    assert(ls.find("\"speaker_role\":1") != std::string::npos);
+
+    // 2. Multi-template `#2/#3` suffix normalization + dynamic SetAcceptThreshold
+    VoiceprintStore store;
+    VoiceprintEngine vp;
+    assert(vp.Init(&store));
+    vp.SetAcceptThreshold(0.72f);
+
+    std::vector<int16_t> tone_a(16000);
+    std::vector<int16_t> tone_b(16000);
+    for (size_t i = 0; i < 16000; ++i) {
+        const double t = static_cast<double>(i) / 16000.0;
+        tone_a[i] = static_cast<int16_t>(std::sin(2.0 * 3.14159265 * 220.0 * t) * 18000.0);
+        tone_b[i] = static_cast<int16_t>(std::sin(2.0 * 3.14159265 * 510.0 * t) * 18000.0);
+    }
+    std::vector<float> emb_a;
+    std::vector<float> emb_b;
+    assert(vp.ExtractEmbedding(tone_a.data(), tone_a.size(), &emb_a));
+    assert(vp.ExtractEmbedding(tone_b.data(), tone_b.size(), &emb_b));
+
+    VoiceprintTemplate t1{"spk_luke", "Luke", SpeakerRole::kOwner, emb_a, 1};
+    VoiceprintTemplate t2{"spk_luke#2", "Luke", SpeakerRole::kOwner, emb_b, 1};
+    assert(store.Upsert(t1));
+    assert(store.Upsert(t2));
+
+    VoiceprintMatch match;
+    assert(vp.Identify(tone_b.data(), tone_b.size(), &match));
+    assert(match.identified);
+    assert(match.speaker_id == "spk_luke"); // `#2` suffix stripped cleanly
+    assert(match.role == SpeakerRole::kOwner);
+    assert(match.score > 0.98f);
+
+    // 3. AudioEngine kVoiceprintDirect PSRAM speculative buffer -> zero-word-loss flush & reject
+    auto board = CreateSelectedBoard();
+    assert(board->Init());
+    AudioEngine engine;
+    AudioEngineConfig acfg;
+    acfg.frame_ms = 60;
+    acfg.afe.vad_energy_threshold = 400.0f;
+    assert(engine.Init(board->Audio(), acfg));
+
+    std::vector<VoiceprintCandidateEvent> candidates;
+    assert(engine.Start(
+        nullptr, nullptr, nullptr,
+        [&](const VoiceprintCandidateEvent& cand) { candidates.push_back(cand); }));
+    engine.SetWakeMode(AudioWakeMode::kVoiceprintDirect, 480, 600);
+    assert(engine.UpdateWakePinyin("小元同学", "xiao yuan tong xue"));
+
+    // Feed 10 frames of 60ms loud speech (600ms > 480ms min_speech_ms)
+    std::vector<int16_t> loud(960);
+    for (size_t i = 0; i < loud.size(); ++i) {
+        loud[i] = static_cast<int16_t>(std::sin(2.0 * 3.14159265 * 300.0 * i / 16000.0) * 12000.0);
+    }
+    for (int f = 0; f < 10; ++f) {
+        AfeStepResult step;
+        assert(engine.ProcessCapturedPcm(loud.data(), loud.size(), &step));
+    }
+    assert(candidates.size() == 1);
+    assert(candidates[0].generation > 0);
+    assert(candidates[0].pcm_16k.size() >= 960 * 8);
+
+    // Accept speculative wake -> flushes full first-sentence PCM with zero lost syllables
+    assert(engine.AcceptSpeculativeWake(candidates[0].generation));
+    assert(engine.IsUplinkEnabled());
+    std::vector<int16_t> flushed;
+    assert(engine.TakePendingSpeculativePcm(&flushed));
+    assert(flushed.size() >= 960 * 8);
+
+    // Reset uplink, test RejectSpeculativeWake enters cooldown & discards buffer
+    engine.SetUplinkEnabled(false);
+    candidates.clear();
+    std::vector<int16_t> silence(960, 0);
+    for (int f = 0; f < 10; ++f) {
+        AfeStepResult step;
+        engine.ProcessCapturedPcm(silence.data(), silence.size(), &step);
+    }
+    for (int f = 0; f < 10; ++f) {
+        AfeStepResult step;
+        engine.ProcessCapturedPcm(loud.data(), loud.size(), &step);
+    }
+    assert(candidates.size() == 1);
+    engine.RejectSpeculativeWake(candidates[0].generation);
+    assert(!engine.IsUplinkEnabled());
+    std::vector<int16_t> empty_flush;
+    assert(!engine.TakePendingSpeculativePcm(&empty_flush));
+    engine.Stop();
+}
+
 } // namespace
 
 int main() {
@@ -1089,6 +1209,7 @@ int main() {
     TestMosaicoWifiUiAndKeyboard();
     TestEd25519Rfc8032VectorsAndEzCryptoFixture();
     TestEzProtocolAndUiPairingFlow();
+    TestPhase3WakeConfigMultiTemplateAndSpeculativeBuffer();
     std::printf("ALL FIRMWARE HOST TESTS PASSED\n");
     return 0;
 }
