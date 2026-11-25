@@ -1,8 +1,8 @@
 # ESP32-S31 智能语音与多模态 Agent 终端技术选型文档
 
-> **版本**：v1.3  
-> **关联架构**：[architecture.md](./architecture.md)（v1.5）  
-> **状态**：固件层（支持 **EZ Assistant 原生直连（含 WSS 硬件指令、原生控制面板/ACL/Loopback MCP 与端侧声纹同步）** 与 **Go Kratos 网关集群** 双模）、网关与微服务层（**Go Kratos 原生 gRPC + NATS 事件总线**）、数据存储层已定型；**Agent 大脑层待定（后续接入自研 Agent 代码，已预留语言无关的 gRPC / NATS + MCP 接入契约）**。
+> **版本**：v1.4  
+> **关联架构**：[architecture.md](./architecture.md)（v1.6）  
+> **状态**：固件层（支持 **EZ Assistant 原生直连（含 WSS 硬件指令、动态 MultiNet7 唤醒词与免唤醒声纹直唤、本机录声纹、原生控制面板/ACL/Loopback MCP 与端侧声纹同步）** 与 **Go Kratos 网关集群** 双模）、网关与微服务层（**Go Kratos 原生 gRPC + NATS 事件总线**）、数据存储层已定型；**Agent 大脑层待定（后续接入自研 Agent 代码，已预留语言无关的 gRPC / NATS + MCP 接入契约）**。
 
 ---
 
@@ -64,7 +64,7 @@
    * 无论自研 Agent 使用 Python、Go、TypeScript 还是 Rust，均可直接通过标准 **MCP（Streamable HTTP / stdio）** 发现并调用 `fleet://topology` 及所有终端的摄像头、传感器、执行器与声纹管理工具。
 3. **EZ Assistant Desktop 控制面板代理、直连原生控制台与双向语音中继（Device Protocol 1.0 扩展）**：
    * **网关代理模式**：网关向已配对 `ez-assistant` Host 的 `DeviceHello` 声明 `console` 与 `speech_relay: true`；Host 提供固定 `peer_ip` 的 `/devices/{device_id}/console/{*path}` 受控反代（禁重定向、`settings/deepseek` 屏蔽、10 MiB 上限），并在 WSS 上扩展 `speech_asr_*`（kind=3 变长 PCM16 上行）与 `speech_tts_*`（kind=4 变长 PCM16 下行）中继帧。
-   * **直连原生模式（Phase 2）**：直连终端通过 `hello.hardware` 声明硬件档案与能力，复用已认证 WSS 通道收发 `device_command` / `device_command_result` 与 `voiceprint_sync` / `voiceprint_sync_ack`；Host 内置原生 `/api/v1/*` 控制台后端、192 维 FBank 声纹库（与固件 `FbankExtractor` 数值对齐）、持久化 `Agent → Device ACL` 校验及带随机 Bearer 令牌的 `127.0.0.1` 受管 MCP 桥接，实现完全脱离 Go 网关与外部 Qdrant 的端云一体控制与声纹管理。
+   * **直连原生模式（Phase 2 & 3）**：直连终端通过 `hello.hardware` 声明硬件档案、能力与当前 `wake_config`，复用已认证 WSS 通道收发 `device_command` / `device_command_result`、`voiceprint_sync` / `voiceprint_sync_ack` 与 `wake_config_sync` / `wake_config_ack`；Host 内置原生 `/api/v1/*` 控制台后端（含 `/api/v1/wake` MultiNet7 拼音校验与三模切换、`/api/v1/voice/capture_embedding` 本机麦克风 3 句声纹采集）、192 维 FBank 多模板声纹库、持久化 `Agent → Device ACL` 校验及带随机 Bearer 令牌的 `127.0.0.1` 受管 MCP 桥接；终端 Core 0 支持 MultiNet7 唤醒词运行时热更新及 PSRAM 推测式首句缓冲（`voiceprint_direct` 模式免唤醒不丢字）。
 
 ---
 

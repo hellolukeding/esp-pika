@@ -1,8 +1,8 @@
 # ESP32-S31 智能语音与多模态 Agent 终端系统架构设计文档
 
-> **版本**：v1.5  
+> **版本**：v1.6  
 > **目标硬件**：ESP32-S31（兼容 ESP32-S3 / P4 高性能平台，支持 C3 / C5 / C6 / ESP32 轻量降级）  
-> **开发框架**：ESP-IDF v6.x（终端）+ EZ Assistant `Device Protocol 1.0` 原生直连与原生控制面板/MCP/声纹（默认消费级模式） / Go Kratos v2 + NATS JetStream（集群网关模式）
+> **开发框架**：ESP-IDF v6.x（终端）+ EZ Assistant `Device Protocol 1.0` 原生直连与原生控制面板/MCP/声纹/多模唤醒（默认消费级模式） / Go Kratos v2 + NATS JetStream（集群网关模式）
 
 ---
 
@@ -243,7 +243,12 @@ model,            data, spiffs,  ,         4M,     readonly
      * **零新增端口的 WSS 硬件控制**：直连终端在已认证的 `hello.hardware` 中声明硬件档案（`mac`、`chip`、`model`、`zone`、`group_id`、`vp_version`、`capabilities`）；Host 与终端复用已钉扎证书的 WSS `/device` 通道收发 `device_command` / `device_command_result`（由终端 Core 1 片内 DRAM 栈上的 `LocalExecutor` 执行 `device.display_show`、`device.audio_set_volume`、`device.sensor_read`、`device.actuator_set`、`device.status_read`、`device.voiceprint_list`、`device.voiceprint_delete` 等能力），不在局域网暴露无鉴权 HTTP 控制面。
      * **Host 内置原生控制面板 & ACL 权限矩阵**：EZ Assistant Runtime 为直连终端自动投影 `console.mode = "native"`，在 `/devices/{device_id}/console/api/v1/*` 本地提供硬件遥测与指令下发、持久化 `Agent → Device ACL` 权限矩阵（`<runtime_home>/device/native_console.json`）及内置 ASR 语音转写验证；桌面端设备详情页原生呈现「概览 / 设备控制与状态 / ACL 权限矩阵 / 声纹与语音」四个页签。
      * **自动受管 Loopback MCP 桥接**：EZ Assistant Runtime 随 `DeviceGatewayService` 在 `127.0.0.1:0` 启动带 256-bit 随机 Bearer 令牌的私有 Streamable HTTP MCP 桥接（`POST /mcp/{device_id}`），并通过 `sync_device_mcp_servers` 自动注册为当前终端的受管 MCP 工具服务；Agent 调用任何硬件工具前均强制校验 `Agent → Device ACL` 并经 WSS 路由至终端执行。
-     * **端云一致的 192 维声纹管理与加密 NVS 同步**：EZ Assistant Runtime 内置与终端 `FbankExtractor` + `ComputePooledFbankEmbedding` 完全一致的 192 维 L2 归一化声纹提取器与持久化声纹库；桌面端录音注册、修改或删除说话人后，Host 经 WSS 下发 `voiceprint_sync`（终端确认 `voiceprint_sync_ack`），由终端 Core 1 写入加密 NVS `VoiceprintStore`，并在唤醒时本地声纹匹配后可选透传说话人元数据。
+     * **端云一致的 192 维声纹管理与加密 NVS 同步**：EZ Assistant Runtime 内置与终端 `FbankExtractor` + `ComputePooledFbankEmbedding` 完全一致的 192 维 L2 归一化声纹提取器与持久化声纹库；支持电脑麦克风录音或直接调用终端 `device.voiceprint_capture` 由 Mosaico 板载 MEMS 麦 + AFE 本地采集并提取 192 维特征（消除跨设备麦频响差异，支持每位说话人最多 3 句多模板均值+子模板匹配）。桌面端注册、修改或删除说话人后，Host 经 WSS 下发 `voiceprint_sync`（终端确认 `voiceprint_sync_ack`），由终端 Core 1 写入加密 NVS `VoiceprintStore`。
+     * **Phase 3 动态自定义唤醒词与三模声纹唤醒（热生效、免重启）**：
+       * **统一配置契约（`WakeConfig`）**：支持三种模式——`wake_word`（默认唤醒词模式，默认中文唤醒词「你好小元」/ MultiNet7 拼音 `ni hao xiao yuan`）、`wake_word_plus_vp`（唤醒词 + 授权声纹双验证）与 `voiceprint_direct`（录入声纹后免唤醒词，直接开口声纹直唤）；配套 `vp_threshold`、`min_speech_ms`、`cooldown_ms`、`vp_wake_chime` 参数。
+       * **安全防呆与回退**：未录入任何声纹时禁止切换至声纹依赖模式；当所有声纹被删除清空时，Host 与终端均自动回退至 `wake_word` 模式（默认「你好小元」），防止设备无法唤醒。
+       * **WSS 双向同步与 NVS 持久化**：`hello.hardware` 上报终端当前 `wake_config` 与 `multinet_ready` 状态；Host 提供 `GET/PUT /api/v1/wake` 校验 MultiNet7 合法音节并经 WSS 下发 `wake_config_sync`，终端 Core 1 落盘 NVS（命名空间 `ez_wake`）并同步至 Core 0 `AfePipeline` 热更新 MultiNet7 词表（失败自动回滚旧词）后回传 `wake_config_ack`。
+       * **PSRAM 推测式首句缓冲（免丢字声纹直唤）**：在 `voiceprint_direct` 模式下暂停 MultiNet7 推理降低功耗，Core 0 在 VAD 检测到人声开始后将 `400ms pre-roll + clean_pcm` 持续写入 PSRAM 推测缓冲（上限 2.5s / ~80KB）；累积满 `min_speech_ms`（默认 700ms）且满足 `SNR >= 5dB` 时异步提交 Core 1 `VoiceprintEngine` 鉴权；命中阈值后立刻开启 `listen_start`（附带 `wake_source`、`speaker_id`、`speaker_role`、`speaker_score`）并将整段推测缓冲无缝补发上行实现**首句零丢字**，未命中则静默丢弃且零网络开销。
    * **本地与远端解绑**：收到 `device_revoked` 错误或在 Mosaico 抽屉点击 `UNPAIR` 后，清空 NVS 配对记录（保留 Ed25519 密钥对）并重新广播 `_ez-device._tcp.local.` 等待重新连接。
 2. **网关集群模式（高级，`gateway_override.enabled == true`）**：
    * 当用户通过配网门户显式指定网关地址 `host:port` 时，终端回退原有 `_esp-gateway._tcp.local.` / `/ws/device` + `AudioTransportCodec::kOpus60ms` 路径，保留 MAC 白名单、NATS JetStream 多机唤醒仲裁、Qdrant 3D-Speaker 声纹集群与 Device MCP Server 完整能力。
