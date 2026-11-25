@@ -443,7 +443,8 @@ std::string EzBuildAuthHelloJson(const std::string& msg_id,
                                  const EzCapabilities& caps,
                                  EzOutputPreference output_preference,
                                  const std::string& client_version,
-                                 const std::string& signature_b64u) {
+                                 const std::string& signature_b64u,
+                                 const EzHardwareProfile* hardware) {
     std::string p = "{";
     p += "\"device_id\":\"" + EscapeJsonString(device_id) + "\"";
     p += ",\"device_nonce\":\"" + EscapeJsonString(device_nonce) + "\"";
@@ -451,8 +452,73 @@ std::string EzBuildAuthHelloJson(const std::string& msg_id,
     p += ",\"output_preference\":\"" + std::string(EzOutputPreferenceWireName(output_preference)) + "\"";
     p += ",\"client_version\":\"" + EscapeJsonString(client_version) + "\"";
     p += ",\"signature\":\"" + EscapeJsonString(signature_b64u) + "\"";
+    if (hardware != nullptr && hardware->enabled) {
+        char vp_buf[32] = {};
+        std::snprintf(vp_buf, sizeof(vp_buf), "%llu",
+                      static_cast<unsigned long long>(hardware->vp_version));
+        p += ",\"hardware\":{";
+        p += "\"mac\":\"" + EscapeJsonString(hardware->mac) + "\"";
+        p += ",\"chip\":\"" + EscapeJsonString(hardware->chip) + "\"";
+        p += ",\"model\":\"" + EscapeJsonString(hardware->model) + "\"";
+        p += ",\"zone\":\"" + EscapeJsonString(hardware->zone) + "\"";
+        p += ",\"group_id\":\"" + EscapeJsonString(hardware->group_id) + "\"";
+        p += ",\"vp_version\":" + std::string(vp_buf);
+        p += ",\"capabilities\":[";
+        for (size_t i = 0; i < hardware->capabilities.size(); ++i) {
+            if (i > 0) {
+                p.push_back(',');
+            }
+            p += "\"" + EscapeJsonString(hardware->capabilities[i]) + "\"";
+        }
+        p += "]}";
+    }
     p.push_back('}');
     return WrapEnvelope(msg_id, "hello", p);
+}
+
+std::string EzBuildDeviceCommandResultJson(const std::string& msg_id,
+                                           const std::string& command_id,
+                                           bool ok,
+                                           const std::string& result_json,
+                                           const std::string& media_url,
+                                           const std::string& error_code,
+                                           const std::string& error_message) {
+    std::string p = "{";
+    p += "\"command_id\":\"" + EscapeJsonString(command_id) + "\"";
+    p += std::string(",\"ok\":") + (ok ? "true" : "false");
+    if (!result_json.empty()) {
+        p += ",\"result_json\":\"" + EscapeJsonString(result_json) + "\"";
+    }
+    if (!media_url.empty()) {
+        p += ",\"media_url\":\"" + EscapeJsonString(media_url) + "\"";
+    }
+    if (!error_code.empty()) {
+        p += ",\"error_code\":\"" + EscapeJsonString(error_code) + "\"";
+    }
+    if (!error_message.empty()) {
+        p += ",\"error_message\":\"" + EscapeJsonString(error_message) + "\"";
+    }
+    p.push_back('}');
+    return WrapEnvelope(msg_id, "device_command_result", p);
+}
+
+std::string EzBuildVoiceprintSyncAckJson(const std::string& msg_id,
+                                         uint64_t vp_version,
+                                         uint32_t count,
+                                         bool ok,
+                                         const std::string& error) {
+    char num_buf[64] = {};
+    std::snprintf(num_buf, sizeof(num_buf), "\"vp_version\":%llu,\"count\":%lu",
+                  static_cast<unsigned long long>(vp_version),
+                  static_cast<unsigned long>(count));
+    std::string p = "{";
+    p += num_buf;
+    p += std::string(",\"ok\":") + (ok ? "true" : "false");
+    if (!error.empty()) {
+        p += ",\"error\":\"" + EscapeJsonString(error) + "\"";
+    }
+    p.push_back('}');
+    return WrapEnvelope(msg_id, "voiceprint_sync_ack", p);
 }
 
 std::string EzBuildSetOutputPreferenceJson(const std::string& msg_id, EzOutputPreference pref) {
@@ -610,6 +676,37 @@ bool EzParseInboundMessage(const std::string& json_text, EzInboundMessage* out) 
         if (ExtractJsonIntField(payload, "stream_id", &sid) && sid > 0) {
             out->stream_id = static_cast<uint32_t>(sid);
         }
+        return true;
+    }
+    if (type == "speech_status_changed") {
+        out->type = EzInboundType::kSpeechStatusChanged;
+        std::string ss_raw;
+        const std::string& src = ExtractJsonRawField(payload, "speech_services", &ss_raw) ? ss_raw : payload;
+        std::string asr_s;
+        std::string tts_s;
+        if (ExtractJsonStringField(src, "asr", &asr_s)) {
+            out->speech_asr_ready = (asr_s != "unavailable" && !asr_s.empty());
+        }
+        if (ExtractJsonStringField(src, "tts", &tts_s)) {
+            out->speech_tts_ready = (tts_s != "unavailable" && !tts_s.empty());
+        }
+        return true;
+    }
+    if (type == "device_command") {
+        out->type = EzInboundType::kDeviceCommand;
+        if (!ExtractJsonStringField(payload, "command_id", &out->device_command.command_id) ||
+            !ExtractJsonStringField(payload, "capability", &out->device_command.capability)) {
+            return false;
+        }
+        ExtractJsonStringField(payload, "action", &out->device_command.action);
+        if (!ExtractJsonStringField(payload, "params_json", &out->device_command.params_json)) {
+            out->device_command.params_json = "{}";
+        }
+        return true;
+    }
+    if (type == "voiceprint_sync") {
+        out->type = EzInboundType::kVoiceprintSync;
+        out->raw_payload = payload;
         return true;
     }
     if (type == "ping") {

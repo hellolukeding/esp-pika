@@ -32,7 +32,7 @@
 namespace {
 
 constexpr const char* kTag = "app_main";
-constexpr const char* kFirmwareVersion = "0.3.0-direct";
+constexpr const char* kFirmwareVersion = "0.4.0-direct";
 
 std::string BuildDefaultMosaicoName(const std::string& mac) {
     std::string hex;
@@ -142,6 +142,7 @@ public:
             return false;
         }
         audio_.SetTransportCodec(audio_cfg.transport_codec);
+        executor_ = std::make_unique<esp_pika::LocalExecutor>(board_.get(), &net_, &vp_store_);
         hw_ready_ = true;
 
         if (ez_direct_mode_) {
@@ -150,6 +151,22 @@ public:
             ez_cfg.display_name = display_name;
             ez_cfg.firmware_version = kFirmwareVersion;
             ez_cfg.control_port = 8765;
+            ez_cfg.hardware.enabled = true;
+            ez_cfg.hardware.mac = factory_mac;
+            ez_cfg.hardware.chip = board_->ChipName();
+            ez_cfg.hardware.model = "esp32s31-mosaico";
+            ez_cfg.hardware.zone = kDefaultZone;
+            ez_cfg.hardware.group_id = kDefaultGroupId;
+            ez_cfg.hardware.vp_version = vp_store_.Version();
+            ez_cfg.hardware.capabilities = {
+                "device.display_show",
+                "device.audio_set_volume",
+                "device.sensor_read",
+                "device.status_read",
+                "device.actuator_set",
+                "device.voiceprint_list",
+                "device.voiceprint_delete",
+            };
 
             esp_pika::EzDeviceCallbacks ez_cbs;
             ez_cbs.on_state = [this](esp_pika::EzClientState s) { HandleEzState(s); };
@@ -184,6 +201,12 @@ public:
                                             const uint8_t* pcm,
                                             size_t len) {
                 HandleEzDownlinkPcm(stream_id, sequence, pcm, len);
+            };
+            ez_cbs.on_device_command = [this](const esp_pika::EzDeviceCommandRequest& cmd) {
+                HandleEzDeviceCommand(cmd);
+            };
+            ez_cbs.on_voiceprint_sync = [this](const std::string& raw_payload) {
+                HandleEzVoiceprintSync(raw_payload);
             };
             ez_client_.Init(ez_cfg, std::move(ez_cbs));
             ui_.SetEzUnpairCallback([this]() { ez_client_.ResetPairing(); });
@@ -936,6 +959,123 @@ private:
         if (matched && reason == "cancelled") {
             audio_.ClearDownlinkQueue();
         }
+    }
+
+    void HandleEzDeviceCommand(const esp_pika::EzDeviceCommandRequest& cmd) {
+        ESP_LOGI(kTag, "ez device_command id=%s cap=%s action=%s",
+                 cmd.command_id.c_str(), cmd.capability.c_str(), cmd.action.c_str());
+        if (cmd.capability == "device.status_read" || cmd.capability == "status.read") {
+            const auto ws = net_.GetWifiStatus();
+            const int volume = (board_ && board_->Audio()) ? board_->Audio()->Volume() : -1;
+            const unsigned free_int =
+                static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+            const unsigned long long vp_ver =
+                static_cast<unsigned long long>(vp_store_.Version());
+            double battery_pct = -1.0;
+            double battery_mv = -1.0;
+            double temp_c = -999.0;
+            if (board_ && board_->Sensors()) {
+                const auto b = board_->Sensors()->Read("battery");
+                if (b.ok) {
+                    battery_pct = b.value;
+                }
+                const auto v = board_->Sensors()->Read("battery_voltage");
+                if (v.ok) {
+                    battery_mv = v.value;
+                }
+                const auto t = board_->Sensors()->Read("temperature");
+                if (t.ok) {
+                    temp_c = t.value;
+                }
+            }
+            char buf[320] = {};
+            std::string json = "{";
+            std::snprintf(buf, sizeof(buf),
+                          "\"chip\":\"%s\",\"mac\":\"%s\",\"rssi\":%d,\"volume\":%d,"
+                          "\"free_int\":%u,\"vp_version\":%llu,\"vp_count\":%u",
+                          board_ ? board_->ChipName() : "esp32s31",
+                          net_.DeviceMac().c_str(),
+                          ws.rssi,
+                          volume,
+                          free_int,
+                          vp_ver,
+                          static_cast<unsigned>(vp_store_.Count()));
+            json += buf;
+            if (battery_pct >= 0.0) {
+                std::snprintf(buf, sizeof(buf), ",\"battery_pct\":%.1f", battery_pct);
+                json += buf;
+            }
+            if (battery_mv >= 0.0) {
+                std::snprintf(buf, sizeof(buf), ",\"battery_mv\":%.0f", battery_mv);
+                json += buf;
+            }
+            if (temp_c > -100.0) {
+                std::snprintf(buf, sizeof(buf), ",\"temperature_c\":%.1f", temp_c);
+                json += buf;
+            }
+            json.push_back('}');
+            ez_client_.SendDeviceCommandResult(cmd.command_id, true, json);
+            return;
+        }
+
+        if (cmd.capability == "device.display_show" || cmd.capability == "lcd.display" ||
+            cmd.capability == "display.lcd" || cmd.capability == "display.status") {
+            std::string emotion = "neutral";
+            std::string text;
+            esp_pika::ExtractJsonStringField(cmd.params_json, "emotion", &emotion);
+            esp_pika::ExtractJsonStringField(cmd.params_json, "text", &text);
+            ui_.ShowMessage(emotion, text);
+            std::string res = "{\"ok\":true,\"emotion\":\"" +
+                              esp_pika::EscapeJsonString(emotion) + "\",\"text\":\"" +
+                              esp_pika::EscapeJsonString(text) + "\"}";
+            ez_client_.SendDeviceCommandResult(cmd.command_id, true, res);
+            return;
+        }
+
+        if (!executor_) {
+            ez_client_.SendDeviceCommandResult(cmd.command_id, false, "", "",
+                                               "EXECUTOR_UNAVAILABLE",
+                                               "local executor not initialized");
+            return;
+        }
+        esp_pika::GatewayCommand gw_cmd;
+        gw_cmd.command_id = cmd.command_id;
+        gw_cmd.capability = cmd.capability;
+        gw_cmd.action = cmd.action;
+        gw_cmd.params_json = cmd.params_json;
+        const esp_pika::CommandResultPayload res = executor_->Execute(gw_cmd);
+        if (res.ok && (cmd.capability == "device.voiceprint_delete" ||
+                       cmd.capability == "voiceprint.delete")) {
+            ez_client_.SetVoiceprintVersion(vp_store_.Version());
+        }
+        ez_client_.SendDeviceCommandResult(res.command_id, res.ok, res.result_json,
+                                           res.media_url, res.error_code, res.error_message);
+    }
+
+    void HandleEzVoiceprintSync(const std::string& raw_payload) {
+        esp_pika::VoiceprintSyncPayload sync;
+        if (!esp_pika::ParseVoiceprintSyncJson(raw_payload, &sync)) {
+            ESP_LOGW(kTag, "failed to parse ez voiceprint_sync payload");
+            ez_client_.SendVoiceprintSyncAck(vp_store_.Version(),
+                                             static_cast<uint32_t>(vp_store_.Count()),
+                                             false, "parse_failed");
+            return;
+        }
+        if (!vp_store_.ApplySync(sync)) {
+            ez_client_.SendVoiceprintSyncAck(vp_store_.Version(),
+                                             static_cast<uint32_t>(vp_store_.Count()),
+                                             false, "apply_failed");
+            return;
+        }
+        const bool saved = vp_store_.SaveToNvs();
+        ez_client_.SetVoiceprintVersion(vp_store_.Version());
+        ESP_LOGI(kTag, "ez voiceprint_sync applied vp_version=%llu count=%zu saved=%d",
+                 static_cast<unsigned long long>(vp_store_.Version()),
+                 vp_store_.Count(),
+                 saved ? 1 : 0);
+        ez_client_.SendVoiceprintSyncAck(vp_store_.Version(),
+                                         static_cast<uint32_t>(vp_store_.Count()),
+                                         saved, saved ? "" : "nvs_save_failed");
     }
 
     void HandleConnectionState(bool connected) {

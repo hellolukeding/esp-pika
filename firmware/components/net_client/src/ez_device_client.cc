@@ -52,7 +52,7 @@ std::string RandomTokenB64Url(size_t num_bytes) {
 #ifdef ESP_PLATFORM
 constexpr const char* kClientTag = "ez_device_client";
 constexpr const char* kDeviceModel = "esp32s31-mosaico";
-constexpr size_t kMaxRxTextBytes = 32768;
+constexpr size_t kMaxRxTextBytes = 65536;
 constexpr size_t kMaxRxBinBytes = 4096;
 constexpr int64_t kPairingTimeoutMs = 30000;
 constexpr int64_t kPassiveMdnsIntervalMs = 5000;
@@ -432,6 +432,34 @@ bool EzDeviceClient::CancelPlayback(const std::string& output_id, uint32_t strea
     return SendJson(EzBuildPlaybackCancelJson(NextMessageId(), output_id, stream_id));
 }
 
+bool EzDeviceClient::SendDeviceCommandResult(const std::string& command_id,
+                                             bool ok,
+                                             const std::string& result_json,
+                                             const std::string& media_url,
+                                             const std::string& error_code,
+                                             const std::string& error_message) {
+    if (command_id.empty() || !IsOnline()) {
+        return false;
+    }
+    return SendJson(EzBuildDeviceCommandResultJson(NextMessageId(), command_id, ok, result_json,
+                                                   media_url, error_code, error_message));
+}
+
+bool EzDeviceClient::SendVoiceprintSyncAck(uint64_t vp_version,
+                                           uint32_t count,
+                                           bool ok,
+                                           const std::string& error) {
+    if (!IsOnline()) {
+        return false;
+    }
+    return SendJson(EzBuildVoiceprintSyncAckJson(NextMessageId(), vp_version, count, ok, error));
+}
+
+void EzDeviceClient::SetVoiceprintVersion(uint64_t vp_version) {
+    std::lock_guard<std::mutex> lock(mu_);
+    cfg_.hardware.vp_version = vp_version;
+}
+
 void EzDeviceClient::HandleInboundEnvelope(const std::string& json_text) {
     EzInboundMessage msg;
     if (!EzParseInboundMessage(json_text, &msg)) {
@@ -452,10 +480,12 @@ void EzDeviceClient::HandleInboundEnvelope(const std::string& json_text) {
         std::string req_id;
         std::string dev_nonce = RandomTokenB64Url(24);
         EzCapabilities caps;
+        EzHardwareProfile hw_snapshot;
         {
             std::lock_guard<std::mutex> lock(mu_);
             is_pairing = ws_pairing_mode_;
             caps = caps_;
+            hw_snapshot = cfg_.hardware;
             device_nonce_ = dev_nonce;
             std::memcpy(seed, identity_.ed25519_seed, sizeof(seed));
             std::memcpy(pub, identity_.ed25519_pub, sizeof(pub));
@@ -475,7 +505,8 @@ void EzDeviceClient::HandleInboundEnvelope(const std::string& json_text) {
                 seed, pub, msg.connection_id, msg.host_nonce, device_id, dev_nonce, caps,
                 EzOutputPreference::kText);
             SendJson(EzBuildAuthHelloJson(NextMessageId(), device_id, dev_nonce, caps,
-                                          EzOutputPreference::kText, cfg_.firmware_version, sig));
+                                          EzOutputPreference::kText, cfg_.firmware_version, sig,
+                                          hw_snapshot.enabled ? &hw_snapshot : nullptr));
         }
         break;
     }
@@ -565,6 +596,32 @@ void EzDeviceClient::HandleInboundEnvelope(const std::string& json_text) {
             callbacks_.on_playback_end(msg.output_id, msg.stream_id, msg.reason);
         }
         break;
+    case EzInboundType::kSpeechStatusChanged: {
+        const bool was_tts = tts_ready_.load(std::memory_order_acquire);
+        asr_ready_.store(msg.speech_asr_ready, std::memory_order_release);
+        tts_ready_.store(msg.speech_tts_ready, std::memory_order_release);
+        if (!was_tts && msg.speech_tts_ready && IsOnline()) {
+            SendJson(EzBuildSetOutputPreferenceJson(NextMessageId(),
+                                                    EzOutputPreference::kTextAndAudio));
+        }
+        break;
+    }
+    case EzInboundType::kDeviceCommand: {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (pending_commands_.size() < 8) {
+            pending_commands_.push_back(std::move(msg.device_command));
+        }
+        break;
+    }
+    case EzInboundType::kVoiceprintSync: {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (pending_vp_syncs_.size() < 4) {
+            pending_vp_syncs_.push_back(std::move(msg.raw_payload));
+        } else if (!pending_vp_syncs_.empty()) {
+            pending_vp_syncs_.back() = std::move(msg.raw_payload);
+        }
+        break;
+    }
     case EzInboundType::kPing:
         SendJson(EzBuildPongJson(NextMessageId(), msg.ping_nonce, msg.ping_sent_at_ms));
         break;
@@ -933,6 +990,7 @@ void EzDeviceClient::WebSocketEventHandler(void* arg,
                     evt->data_ptr, std::min<size_t>(static_cast<size_t>(evt->data_len), room));
             }
             const bool complete =
+                evt->fin &&
                 (evt->payload_len <= 0 || evt->payload_offset + evt->data_len >= evt->payload_len);
             if (complete && !self->rx_text_buf_.empty()) {
                 std::string json_msg = std::move(self->rx_text_buf_);
@@ -950,6 +1008,7 @@ void EzDeviceClient::WebSocketEventHandler(void* arg,
                 self->rx_bin_buf_.insert(self->rx_bin_buf_.end(), ptr, ptr + copy_n);
             }
             const bool complete =
+                evt->fin &&
                 (evt->payload_len <= 0 || evt->payload_offset + evt->data_len >= evt->payload_len);
             if (complete && !self->rx_bin_buf_.empty()) {
                 std::vector<uint8_t> bin_msg = std::move(self->rx_bin_buf_);
@@ -966,6 +1025,31 @@ void EzDeviceClient::WebSocketEventHandler(void* arg,
 
 void EzDeviceClient::TickFast(uint32_t dt_ms) {
     (void)dt_ms;
+    // Drain inbound WSS hardware commands and voiceprint syncs on Core 1's internal-DRAM stack
+    // so NVS/Flash writes and HAL calls stay safe (AGENTS.md §3.1).
+    {
+        std::vector<EzDeviceCommandRequest> cmds;
+        std::vector<std::string> vp_syncs;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (!pending_commands_.empty()) {
+                cmds.swap(pending_commands_);
+            }
+            if (!pending_vp_syncs_.empty()) {
+                vp_syncs.swap(pending_vp_syncs_);
+            }
+        }
+        if (callbacks_.on_device_command) {
+            for (const auto& cmd : cmds) {
+                callbacks_.on_device_command(cmd);
+            }
+        }
+        if (callbacks_.on_voiceprint_sync) {
+            for (const auto& raw_sync : vp_syncs) {
+                callbacks_.on_voiceprint_sync(raw_sync);
+            }
+        }
+    }
 #ifndef ESP_PLATFORM
     if (pending_reset_pairing_.exchange(false, std::memory_order_acq_rel)) {
         std::lock_guard<std::mutex> lock(mu_);

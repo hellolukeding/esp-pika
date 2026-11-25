@@ -30,18 +30,19 @@ CommandResultPayload LocalExecutor::Execute(const GatewayCommand& cmd) {
         return ExecuteCameraCapture(cmd);
     }
     if (cmd.capability == "device.audio_set_volume" || cmd.capability == "audio.set_volume" ||
-        cmd.capability == "audio.output") {
+        cmd.capability == "audio.volume" || cmd.capability == "audio.output") {
         return ExecuteSetVolume(cmd);
     }
     if (cmd.capability == "device.actuator_set" || cmd.capability == "actuator.led" ||
-        cmd.capability == "actuator.set") {
+        cmd.capability == "actuator.set" || cmd.capability == "gpio.set") {
         return ExecuteActuatorSet(cmd);
     }
     if (cmd.capability == "device.display_show" || cmd.capability == "display.lcd" ||
-        cmd.capability == "display.status") {
+        cmd.capability == "lcd.display" || cmd.capability == "display.status") {
         return ExecuteDisplayShow(cmd);
     }
-    if (cmd.capability == "device.sensor_read" || cmd.capability == "sensor.env") {
+    if (cmd.capability == "device.sensor_read" || cmd.capability == "sensor.read" ||
+        cmd.capability == "sensor.env") {
         return ExecuteSensorRead(cmd);
     }
     if (cmd.capability == "device.voiceprint_list" || cmd.capability == "voiceprint.list") {

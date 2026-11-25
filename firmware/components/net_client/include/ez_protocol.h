@@ -94,13 +94,48 @@ std::string EzBuildPairingDirectCommitJson(const std::string& msg_id,
                                            const std::string& device_id,
                                            const std::string& signature_b64u);
 
+/// Hardware profile declared in authenticated `hello.hardware` for Phase 2 native console & MCP.
+struct EzHardwareProfile {
+    bool enabled = false;
+    std::string mac;
+    std::string chip;
+    std::string model;
+    std::string zone;
+    std::string group_id;
+    uint64_t vp_version = 0;
+    std::vector<std::string> capabilities;
+};
+
+/// Inbound hardware control command delivered over authenticated WSS `/device`.
+struct EzDeviceCommandRequest {
+    std::string command_id;
+    std::string capability;
+    std::string action;
+    std::string params_json;
+};
+
 std::string EzBuildAuthHelloJson(const std::string& msg_id,
                                  const std::string& device_id,
                                  const std::string& device_nonce,
                                  const EzCapabilities& caps,
                                  EzOutputPreference output_preference,
                                  const std::string& client_version,
-                                 const std::string& signature_b64u);
+                                 const std::string& signature_b64u,
+                                 const EzHardwareProfile* hardware = nullptr);
+
+std::string EzBuildDeviceCommandResultJson(const std::string& msg_id,
+                                           const std::string& command_id,
+                                           bool ok,
+                                           const std::string& result_json,
+                                           const std::string& media_url,
+                                           const std::string& error_code,
+                                           const std::string& error_message);
+
+std::string EzBuildVoiceprintSyncAckJson(const std::string& msg_id,
+                                         uint64_t vp_version,
+                                         uint32_t count,
+                                         bool ok,
+                                         const std::string& error = "");
 
 std::string EzBuildSetOutputPreferenceJson(const std::string& msg_id, EzOutputPreference pref);
 
@@ -136,6 +171,9 @@ enum class EzInboundType {
     kTextOutput,
     kPlaybackStart,
     kPlaybackEnd,
+    kSpeechStatusChanged,
+    kDeviceCommand,
+    kVoiceprintSync,
     kPing,
     kError,
 };
@@ -157,6 +195,16 @@ struct EzInboundMessage {
     // hello_ack / output_preference_changed
     EzCapabilities capabilities;
     EzOutputPreference output_preference = EzOutputPreference::kText;
+
+    // speech_status_changed
+    bool speech_asr_ready = false;
+    bool speech_tts_ready = false;
+
+    // device_command
+    EzDeviceCommandRequest device_command;
+
+    // voiceprint_sync (raw JSON object of `payload` for VoiceprintStore)
+    std::string raw_payload;
 
     // state_changed / transcript / text_output
     std::string state;

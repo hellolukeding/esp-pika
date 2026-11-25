@@ -30,8 +30,9 @@ enum class EzClientState {
 struct EzDeviceClientConfig {
     std::string mac;
     std::string display_name = "Mosaico";
-    std::string firmware_version = "0.3.0-direct";
+    std::string firmware_version = "0.4.0-direct";
     uint16_t control_port = 8765;
+    EzHardwareProfile hardware;
 };
 
 struct EzDeviceCallbacks {
@@ -45,6 +46,10 @@ struct EzDeviceCallbacks {
         on_playback_end;
     std::function<void(uint32_t stream_id, uint32_t sequence, const uint8_t* pcm, size_t len)>
         on_downlink_pcm;
+    /// Invoked on Core 1 internal-DRAM task inside TickFast() so NVS/HAL operations stay safe.
+    std::function<void(const EzDeviceCommandRequest& cmd)> on_device_command;
+    /// Invoked on Core 1 internal-DRAM task inside TickFast() with raw `voiceprint_sync` JSON payload.
+    std::function<void(const std::string& raw_payload)> on_voiceprint_sync;
 };
 
 /// Direct Device Protocol 1.0 client for EZ Assistant Desktop:
@@ -78,6 +83,17 @@ public:
     bool StopListen(uint32_t stream_id, uint32_t last_sequence);
     bool CancelListen(uint32_t stream_id);
     bool CancelPlayback(const std::string& output_id, uint32_t stream_id);
+    bool SendDeviceCommandResult(const std::string& command_id,
+                                 bool ok,
+                                 const std::string& result_json,
+                                 const std::string& media_url = "",
+                                 const std::string& error_code = "",
+                                 const std::string& error_message = "");
+    bool SendVoiceprintSyncAck(uint64_t vp_version,
+                               uint32_t count,
+                               bool ok,
+                               const std::string& error = "");
+    void SetVoiceprintVersion(uint64_t vp_version);
 
     EzClientState State() const {
         return static_cast<EzClientState>(state_.load(std::memory_order_acquire));
@@ -131,6 +147,8 @@ private:
 
     EzPairingIdentity identity_;
     EzCapabilities caps_;
+    std::vector<EzDeviceCommandRequest> pending_commands_;
+    std::vector<std::string> pending_vp_syncs_;
 
     // Active pairing / auth handshake state protected by `mu_`
     bool ws_pairing_mode_ = false;

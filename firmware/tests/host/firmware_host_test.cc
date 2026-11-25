@@ -998,6 +998,78 @@ void TestEzProtocolAndUiPairingFlow() {
     ui.OnTouch({false, 270, 170, 0}, 1020, &snap);
     assert(unpair_called);
     assert(!snap.ez_paired && !ui.IsDrawerOpen());
+
+    // Phase 2: hardware hello, device_command, speech_status_changed, voiceprint_sync, and aliases
+    EzHardwareProfile hw;
+    hw.enabled = true;
+    hw.mac = "30:ed:a0:f4:5b:f0";
+    hw.chip = "esp32s31";
+    hw.model = "esp32s31-mosaico";
+    hw.zone = "desk";
+    hw.group_id = "home-default";
+    hw.vp_version = 3;
+    hw.capabilities = {"device.display_show", "device.audio_set_volume", "device.sensor_read"};
+    const std::string hello_hw = EzBuildAuthHelloJson(
+        "m-hw-1", "dev-1", "nonce-1", EzCapabilities{}, EzOutputPreference::kText,
+        "0.4.0-direct", "sig-1", &hw);
+    assert(hello_hw.find("\"hardware\":{") != std::string::npos);
+    assert(hello_hw.find("\"vp_version\":3") != std::string::npos);
+    assert(hello_hw.find("\"device.display_show\"") != std::string::npos);
+
+    EzInboundMessage cmd_msg;
+    assert(EzParseInboundMessage(
+        "{\"protocol_major\":1,\"protocol_minor\":0,\"message_id\":\"m-cmd-1\",\"type\":\"device_command\","
+        "\"payload\":{\"command_id\":\"cmd-42\",\"capability\":\"device.display_show\",\"action\":\"show\","
+        "\"params_json\":\"{\\\"emotion\\\":\\\"happy\\\",\\\"text\\\":\\\"Hi\\\"}\"}}",
+        &cmd_msg));
+    assert(cmd_msg.type == EzInboundType::kDeviceCommand);
+    assert(cmd_msg.device_command.command_id == "cmd-42");
+    assert(cmd_msg.device_command.capability == "device.display_show");
+    assert(cmd_msg.device_command.action == "show");
+    std::string emo;
+    assert(ExtractJsonStringField(cmd_msg.device_command.params_json, "emotion", &emo) &&
+           emo == "happy");
+
+    const std::string cmd_res = EzBuildDeviceCommandResultJson(
+        "m-res-1", "cmd-42", true, "{\"ok\":true}", "", "", "");
+    assert(cmd_res.find("\"type\":\"device_command_result\"") != std::string::npos);
+    assert(cmd_res.find("\"command_id\":\"cmd-42\"") != std::string::npos);
+
+    EzInboundMessage ss_msg;
+    assert(EzParseInboundMessage(
+        "{\"protocol_major\":1,\"protocol_minor\":0,\"message_id\":\"m-ss-1\","
+        "\"type\":\"speech_status_changed\","
+        "\"payload\":{\"speech_services\":{\"asr\":\"ready\",\"tts\":\"unavailable\"}}}",
+        &ss_msg));
+    assert(ss_msg.type == EzInboundType::kSpeechStatusChanged);
+    assert(ss_msg.speech_asr_ready && !ss_msg.speech_tts_ready);
+
+    EzInboundMessage vp_msg;
+    assert(EzParseInboundMessage(
+        "{\"protocol_major\":1,\"protocol_minor\":0,\"message_id\":\"m-vp-1\","
+        "\"type\":\"voiceprint_sync\","
+        "\"payload\":{\"group_id\":\"home-default\",\"vp_version\":5,\"full_sync\":true,"
+        "\"upserts\":[{\"speaker_id\":\"spk_1\",\"display_name\":\"Luke\",\"role\":1,"
+        "\"version\":5,\"embedding\":[0.5,0.5,0.5,0.5]}],\"deleted_speaker_ids\":[]}}",
+        &vp_msg));
+    assert(vp_msg.type == EzInboundType::kVoiceprintSync);
+    VoiceprintSyncPayload vp_sync;
+    assert(ParseVoiceprintSyncJson(vp_msg.raw_payload, &vp_sync));
+    assert(vp_sync.vp_version == 5 && vp_sync.upserts.size() == 1);
+    VoiceprintStore vp_store_test;
+    assert(vp_store_test.ApplySync(vp_sync));
+    assert(vp_store_test.Version() == 5 && vp_store_test.Count() == 1);
+    const std::string vp_ack = EzBuildVoiceprintSyncAckJson("m-ack-1", 5, 1, true);
+    assert(vp_ack.find("\"type\":\"voiceprint_sync_ack\"") != std::string::npos);
+
+    LocalExecutor alias_exec(mosaico_board.get(), nullptr, &vp_store_test);
+    GatewayCommand vol_cmd;
+    vol_cmd.command_id = "c-vol";
+    vol_cmd.capability = "audio.volume";
+    vol_cmd.action = "set_volume";
+    vol_cmd.params_json = "{\"level\":66}";
+    const auto vol_res = alias_exec.Execute(vol_cmd);
+    assert(vol_res.ok && mosaico_board->Audio()->Volume() == 66);
 }
 
 } // namespace
