@@ -135,6 +135,9 @@ public:
 
     /// Drains uplink SendQ into the supplied sender callback; returns count flushed.
     size_t FlushUplink(const OpusUplinkCallback& sender);
+    /// Drains uplink SendQ while `sender` returns true; stops immediately on false.
+    size_t FlushUplinkChecked(const std::function<bool(const uint8_t* frame, size_t len)>& sender,
+                              bool* out_aborted = nullptr);
 
     void ClearQueues();
 

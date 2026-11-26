@@ -12,6 +12,7 @@
 #ifdef ESP_PLATFORM
 #include <arpa/inet.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -319,6 +320,16 @@ void EzDeviceClient::SetState(EzClientState next) {
     }
 }
 
+void EzDeviceClient::EnqueueJsonTx(std::string json_text) {
+    if (json_text.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    if (pending_tx_json_.size() < 16) {
+        pending_tx_json_.push_back(std::move(json_text));
+    }
+}
+
 bool EzDeviceClient::SendJson(const std::string& json_text) {
 #ifdef ESP_PLATFORM
     if (ws_closing_.load(std::memory_order_acquire)) {
@@ -523,15 +534,15 @@ void EzDeviceClient::HandleInboundEnvelope(const std::string& json_text) {
             }
         }
         if (is_pairing) {
-            SendJson(EzBuildPairingHelloJson(NextMessageId(), req_id, display_name, dev_nonce, caps,
-                                             pub_b64, cfg_.firmware_version));
+            EnqueueJsonTx(EzBuildPairingHelloJson(NextMessageId(), req_id, display_name, dev_nonce,
+                                                  caps, pub_b64, cfg_.firmware_version));
         } else {
             const std::string sig = EzComputeAuthSignature(
                 seed, pub, msg.connection_id, msg.host_nonce, device_id, dev_nonce, caps,
                 EzOutputPreference::kText);
-            SendJson(EzBuildAuthHelloJson(NextMessageId(), device_id, dev_nonce, caps,
-                                          EzOutputPreference::kText, cfg_.firmware_version, sig,
-                                          hw_snapshot.enabled ? &hw_snapshot : nullptr));
+            EnqueueJsonTx(EzBuildAuthHelloJson(NextMessageId(), device_id, dev_nonce, caps,
+                                               EzOutputPreference::kText, cfg_.firmware_version,
+                                               sig, hw_snapshot.enabled ? &hw_snapshot : nullptr));
         }
         break;
     }
@@ -552,8 +563,8 @@ void EzDeviceClient::HandleInboundEnvelope(const std::string& json_text) {
             }
         }
         if (valid) {
-            SendJson(EzBuildPairingDirectCommitJson(NextMessageId(), msg.pairing_request_id,
-                                                    msg.device_id, sig));
+            EnqueueJsonTx(EzBuildPairingDirectCommitJson(NextMessageId(), msg.pairing_request_id,
+                                                         msg.device_id, sig));
         }
         break;
     }
@@ -589,8 +600,8 @@ void EzDeviceClient::HandleInboundEnvelope(const std::string& json_text) {
         tts_ready_.store(tts_ok, std::memory_order_release);
         SetState(EzClientState::kOnline);
         if (tts_ok && msg.output_preference != EzOutputPreference::kTextAndAudio) {
-            SendJson(EzBuildSetOutputPreferenceJson(NextMessageId(),
-                                                    EzOutputPreference::kTextAndAudio));
+            EnqueueJsonTx(EzBuildSetOutputPreferenceJson(NextMessageId(),
+                                                         EzOutputPreference::kTextAndAudio));
         }
         break;
     }
@@ -626,8 +637,8 @@ void EzDeviceClient::HandleInboundEnvelope(const std::string& json_text) {
         asr_ready_.store(msg.speech_asr_ready, std::memory_order_release);
         tts_ready_.store(msg.speech_tts_ready, std::memory_order_release);
         if (!was_tts && msg.speech_tts_ready && IsOnline()) {
-            SendJson(EzBuildSetOutputPreferenceJson(NextMessageId(),
-                                                    EzOutputPreference::kTextAndAudio));
+            EnqueueJsonTx(EzBuildSetOutputPreferenceJson(NextMessageId(),
+                                                         EzOutputPreference::kTextAndAudio));
         }
         break;
     }
@@ -657,7 +668,7 @@ void EzDeviceClient::HandleInboundEnvelope(const std::string& json_text) {
         break;
     }
     case EzInboundType::kPing:
-        SendJson(EzBuildPongJson(NextMessageId(), msg.ping_nonce, msg.ping_sent_at_ms));
+        EnqueueJsonTx(EzBuildPongJson(NextMessageId(), msg.ping_nonce, msg.ping_sent_at_ms));
         break;
     case EzInboundType::kError:
 #ifdef ESP_PLATFORM
@@ -923,6 +934,7 @@ bool EzDeviceClient::StartWebSocketLocked(const std::string& host,
         ws_pairing_mode_ = pairing_mode;
         pairing_req_id_.clear();
         device_nonce_.clear();
+        pending_tx_json_.clear();
         if (pairing_mode) {
             pairing_started_ms_ = NowMsMonotonic();
         }
@@ -945,7 +957,7 @@ bool EzDeviceClient::StartWebSocketLocked(const std::string& host,
     ws_cfg.task_prio = 6;
     ws_cfg.task_stack = 8192;
     ws_cfg.buffer_size = 4096;
-    ws_cfg.network_timeout_ms = 8000;
+    ws_cfg.network_timeout_ms = 4000;
 
     ws_handle_ = esp_websocket_client_init(&ws_cfg);
     if (ws_handle_ == nullptr) {
@@ -954,6 +966,9 @@ bool EzDeviceClient::StartWebSocketLocked(const std::string& host,
     esp_websocket_register_events(ws_handle_, WEBSOCKET_EVENT_ANY,
                                   &EzDeviceClient::WebSocketEventHandler, this);
     if (esp_websocket_client_start(ws_handle_) != ESP_OK) {
+        ESP_LOGW(kClientTag, "esp_websocket_client_start failed (free_int=%u largest_int=%u)",
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
         esp_websocket_client_destroy(ws_handle_);
         ws_handle_ = nullptr;
         return false;
@@ -975,6 +990,10 @@ void EzDeviceClient::StopWebSocketLocked() {
     if (handle != nullptr) {
         esp_websocket_client_stop(handle);
         esp_websocket_client_destroy(handle);
+    }
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        pending_tx_json_.clear();
     }
     ws_closing_.store(false, std::memory_order_release);
 }
@@ -1059,6 +1078,23 @@ void EzDeviceClient::WebSocketEventHandler(void* arg,
 
 void EzDeviceClient::TickFast(uint32_t dt_ms) {
     (void)dt_ms;
+    // Drain protocol TX replies (auth hello, pong, output preference) on Core 1's internal-DRAM
+    // stack so WebSocketEventHandler never re-enters esp_websocket_client_send_* while holding
+    // esp_websocket_client's internal lock (eliminates AB-BA deadlock with tx_mu_).
+    {
+        std::vector<std::string> tx_json;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (!pending_tx_json_.empty()) {
+                tx_json.swap(pending_tx_json_);
+            }
+        }
+        for (const auto& payload : tx_json) {
+            if (!SendJson(payload)) {
+                break;
+            }
+        }
+    }
     // Drain inbound WSS hardware commands, voiceprint syncs, and wake config syncs on Core 1's
     // internal-DRAM stack so NVS/Flash writes and HAL calls stay safe (AGENTS.md §3.1).
     {

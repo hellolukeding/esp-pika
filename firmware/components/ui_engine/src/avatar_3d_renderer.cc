@@ -319,7 +319,8 @@ bool Avatar3DRenderer::Init() {
     matcap_565_ = static_cast<uint16_t*>(alloc_spiram_first(mc_count * sizeof(uint16_t)));
     rainbow_lut_ = static_cast<Rgb8*>(alloc_fast(static_cast<size_t>(kRainbowSize) * sizeof(Rgb8)));
     sin_lut_ = static_cast<float*>(alloc_fast(static_cast<size_t>(kSinSize) * sizeof(float)));
-    tuft_grid_ = static_cast<TuftGridNode*>(alloc_fast(grid_count * sizeof(TuftGridNode)));
+    // Keep 24 KB pose-cached coarse tuft grid in PSRAM so internal DRAM stays free for Wi-Fi/TLS DMA.
+    tuft_grid_ = static_cast<TuftGridNode*>(alloc_spiram_first(grid_count * sizeof(TuftGridNode)));
     cached_orb_ = static_cast<uint16_t*>(
         heap_caps_malloc(orb_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (matcap_lut_ == nullptr || matcap_565_ == nullptr || rainbow_lut_ == nullptr ||

@@ -91,34 +91,40 @@ bool AudioEngine::Init(AudioCodecHal* codec, const AudioEngineConfig& cfg) {
         heap_caps_malloc(rx_samples * sizeof(int16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
     dma_tx_pcm_ = static_cast<int16_t*>(
         heap_caps_malloc(tx_max_samples_ * sizeof(int16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
-    // Allocate larger codec scratch in PSRAM.
-    spiram_opus_scratch_ = static_cast<uint8_t*>(
-        heap_caps_malloc(kOpusFrameMaxBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-
-    if (dma_rx_pcm_ == nullptr || dma_tx_pcm_ == nullptr || spiram_opus_scratch_ == nullptr) {
-        ESP_LOGE(kTag, "failed to allocate audio buffers (DMA/PSRAM)");
+    if (dma_rx_pcm_ == nullptr || dma_tx_pcm_ == nullptr) {
+        ESP_LOGE(kTag, "failed to allocate audio DMA buffers");
         return false;
     }
 
-    esp_opus_enc_config_t enc_cfg = ESP_OPUS_ENC_CONFIG_DEFAULT();
-    enc_cfg.sample_rate = static_cast<int>(cfg_.uplink_sample_rate);
-    enc_cfg.channel = 1;
-    enc_cfg.bits_per_sample = 16;
-    enc_cfg.bitrate = 24000;
-    enc_cfg.frame_duration = ESP_OPUS_ENC_FRAME_DURATION_60_MS;
-    enc_cfg.application_mode = ESP_OPUS_ENC_APPLICATION_VOIP;
-    if (esp_opus_enc_open(&enc_cfg, sizeof(enc_cfg), &opus_enc_) != ESP_AUDIO_ERR_OK) {
-        ESP_LOGE(kTag, "esp_opus_enc_open failed");
-        return false;
-    }
+    // Only open Opus encoder/decoder in legacy gateway Opus mode; EZ direct mode streams
+    // raw 16kHz PCM16 and skipping unused Opus instances preserves internal DRAM & boot time.
+    if (cfg_.transport_codec == AudioTransportCodec::kOpus60ms) {
+        spiram_opus_scratch_ = static_cast<uint8_t*>(
+            heap_caps_malloc(kOpusFrameMaxBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (spiram_opus_scratch_ == nullptr) {
+            ESP_LOGE(kTag, "failed to allocate PSRAM opus scratch buffer");
+            return false;
+        }
+        esp_opus_enc_config_t enc_cfg = ESP_OPUS_ENC_CONFIG_DEFAULT();
+        enc_cfg.sample_rate = static_cast<int>(cfg_.uplink_sample_rate);
+        enc_cfg.channel = 1;
+        enc_cfg.bits_per_sample = 16;
+        enc_cfg.bitrate = 24000;
+        enc_cfg.frame_duration = ESP_OPUS_ENC_FRAME_DURATION_60_MS;
+        enc_cfg.application_mode = ESP_OPUS_ENC_APPLICATION_VOIP;
+        if (esp_opus_enc_open(&enc_cfg, sizeof(enc_cfg), &opus_enc_) != ESP_AUDIO_ERR_OK) {
+            ESP_LOGE(kTag, "esp_opus_enc_open failed");
+            return false;
+        }
 
-    esp_opus_dec_cfg_t dec_cfg = ESP_OPUS_DEC_CONFIG_DEFAULT();
-    dec_cfg.sample_rate = static_cast<int>(cfg_.uplink_sample_rate);
-    dec_cfg.channel = 1;
-    dec_cfg.frame_duration = ESP_OPUS_DEC_FRAME_DURATION_120_MS;
-    if (esp_opus_dec_open(&dec_cfg, sizeof(dec_cfg), &opus_dec_) != ESP_AUDIO_ERR_OK) {
-        ESP_LOGE(kTag, "esp_opus_dec_open failed");
-        return false;
+        esp_opus_dec_cfg_t dec_cfg = ESP_OPUS_DEC_CONFIG_DEFAULT();
+        dec_cfg.sample_rate = static_cast<int>(cfg_.uplink_sample_rate);
+        dec_cfg.channel = 1;
+        dec_cfg.frame_duration = ESP_OPUS_DEC_FRAME_DURATION_120_MS;
+        if (esp_opus_dec_open(&dec_cfg, sizeof(dec_cfg), &opus_dec_) != ESP_AUDIO_ERR_OK) {
+            ESP_LOGE(kTag, "esp_opus_dec_open failed");
+            return false;
+        }
     }
 #endif
     return true;
@@ -493,16 +499,14 @@ bool AudioEngine::EnqueueDownlinkOpus(const uint8_t* frame, size_t len) {
     if (decode_queue_ == nullptr || frame == nullptr || len == 0) {
         return false;
     }
-    std::vector<uint8_t> buf(frame, frame + len);
-    return decode_queue_->PushDropOldest(std::move(buf));
+    return decode_queue_->PushBytesDropOldest(frame, len);
 }
 
 bool AudioEngine::EnqueueDownlinkPcm16(const uint8_t* pcm_bytes, size_t len) {
     if (decode_queue_ == nullptr || pcm_bytes == nullptr || len < 2 || (len % 2) != 0) {
         return false;
     }
-    std::vector<uint8_t> buf(pcm_bytes, pcm_bytes + len);
-    return decode_queue_->PushDropOldest(std::move(buf));
+    return decode_queue_->PushBytesDropOldest(pcm_bytes, len);
 }
 
 void AudioEngine::ClearDownlinkQueue() {
@@ -526,9 +530,32 @@ size_t AudioEngine::FlushUplink(const OpusUplinkCallback& sender) {
         return 0;
     }
     size_t count = 0;
-    std::vector<uint8_t> frame;
-    while (send_queue_->Pop(&frame)) {
+    BoundedFrameQueue::PsramFrame frame;
+    while (send_queue_->PopFrame(&frame)) {
         sender(frame.data(), frame.size());
+        ++count;
+    }
+    return count;
+}
+
+size_t AudioEngine::FlushUplinkChecked(
+    const std::function<bool(const uint8_t* frame, size_t len)>& sender,
+    bool* out_aborted) {
+    if (out_aborted != nullptr) {
+        *out_aborted = false;
+    }
+    if (send_queue_ == nullptr || !sender) {
+        return 0;
+    }
+    size_t count = 0;
+    BoundedFrameQueue::PsramFrame frame;
+    while (send_queue_->PopFrame(&frame)) {
+        if (!sender(frame.data(), frame.size())) {
+            if (out_aborted != nullptr) {
+                *out_aborted = true;
+            }
+            break;
+        }
         ++count;
     }
     return count;
@@ -558,8 +585,13 @@ void AudioEngine::RunInputLoop() {
     const size_t rx_samples = (cfg_.uplink_sample_rate * cfg_.frame_ms) / 1000;
     const size_t chunk = (cfg_.uplink_sample_rate * cfg_.frame_ms) / 1000;
     std::vector<int16_t> uplink_pcm_buf;
+    // Reserve > ALWAYSINTERNAL upfront so the PCM staging buffer lives permanently in PSRAM.
+    uplink_pcm_buf.reserve(2048);
     uint32_t sent_frames = 0;
     auto encode_one_chunk = [this, chunk, &sent_frames](const int16_t* pcm) {
+        if (opus_enc_ == nullptr || spiram_opus_scratch_ == nullptr) {
+            return;
+        }
         esp_audio_enc_in_frame_t in_frame = {};
         in_frame.buffer = reinterpret_cast<uint8_t*>(const_cast<int16_t*>(pcm));
         in_frame.len = static_cast<uint32_t>(chunk * sizeof(int16_t));
@@ -571,9 +603,7 @@ void AudioEngine::RunInputLoop() {
 
         if (esp_opus_enc_process(opus_enc_, &in_frame, &out_frame) == ESP_AUDIO_ERR_OK &&
             out_frame.encoded_bytes > 0) {
-            std::vector<uint8_t> pkt(spiram_opus_scratch_,
-                                     spiram_opus_scratch_ + out_frame.encoded_bytes);
-            send_queue_->PushDropOldest(std::move(pkt));
+            send_queue_->PushBytesDropOldest(spiram_opus_scratch_, out_frame.encoded_bytes);
             ++sent_frames;
         }
     };
@@ -685,8 +715,7 @@ void AudioEngine::RunInputLoop() {
             constexpr size_t kPcm20MsSamples = 320;
             while (uplink_pcm_buf.size() >= kPcm20MsSamples) {
                 const auto* raw_bytes = reinterpret_cast<const uint8_t*>(uplink_pcm_buf.data());
-                std::vector<uint8_t> pkt(raw_bytes, raw_bytes + (kPcm20MsSamples * sizeof(int16_t)));
-                send_queue_->PushDropOldest(std::move(pkt));
+                send_queue_->PushBytesDropOldest(raw_bytes, kPcm20MsSamples * sizeof(int16_t));
                 ++sent_frames;
                 uplink_pcm_buf.erase(
                     uplink_pcm_buf.begin(),
@@ -715,6 +744,9 @@ void AudioEngine::RunOutputLoop() {
     int16_t last_tx_sample = 0;
     int idle_ticks = 0;
     int prebuf_ticks = 0;
+    int empty_grace_ticks = 0;
+    uint32_t playback_frames = 0;
+    uint32_t playback_grace_waits = 0;
     while (running_.load()) {
         if (wake_chime_pending_.exchange(false, std::memory_order_acq_rel)) {
             if (decode_queue_->Size() == 0) {
@@ -763,8 +795,10 @@ void AudioEngine::RunOutputLoop() {
                 vTaskDelay(pdMS_TO_TICKS(10));
                 continue;
             }
-            const size_t prebuf_target = raw_pcm ? 3U : 6U;
-            if (q_sz < prebuf_target && prebuf_ticks < 12) {
+            // Buffer 160ms (8 * 20ms) for raw PCM16 to absorb 2.4GHz Wi-Fi jitter cleanly
+            // without starving I2S DMA; host bursts the initial 200ms cushion on playback_start.
+            const size_t prebuf_target = raw_pcm ? 8U : 6U;
+            if (q_sz < prebuf_target && prebuf_ticks < 20) {
                 ++prebuf_ticks;
                 vTaskDelay(pdMS_TO_TICKS(10));
                 continue;
@@ -773,9 +807,18 @@ void AudioEngine::RunOutputLoop() {
                 esp_opus_dec_reset(opus_dec_);
             }
         }
-        std::vector<uint8_t> pkt;
-        if (!decode_queue_->Pop(&pkt)) {
+        BoundedFrameQueue::PsramFrame pkt;
+        if (!decode_queue_->PopFrame(&pkt)) {
             if (playing_downlink) {
+                // I2S TX hardware DMA holds 160ms of queued audio (8 * 320 samples); wait up to
+                // 60ms (12 * 5ms) for the next network packet before tearing down playback so
+                // brief Wi-Fi jitter never inserts silence pops or triggers re-prebuffering.
+                if (empty_grace_ticks < 12) {
+                    ++empty_grace_ticks;
+                    ++playback_grace_waits;
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                    continue;
+                }
                 constexpr size_t kRampSamples = 64;
                 constexpr size_t kTailZeros = 160;
                 const size_t ramp_out_samples = std::min<size_t>(kRampSamples + kTailZeros, tx_max_samples_);
@@ -792,9 +835,15 @@ void AudioEngine::RunOutputLoop() {
                 if (cfg_.afe.enable_aec && aec_ref_ring_) {
                     aec_ref_ring_->PushSamples(dma_tx_pcm_, ramp_out_samples);
                 }
+                ESP_LOGI(kTag, "downlink playback finished: frames=%lu grace_waits=%lu",
+                         static_cast<unsigned long>(playback_frames),
+                         static_cast<unsigned long>(playback_grace_waits));
                 playing_downlink = false;
                 last_tx_sample = 0;
                 prebuf_ticks = 0;
+                empty_grace_ticks = 0;
+                playback_frames = 0;
+                playback_grace_waits = 0;
                 idle_ticks = 0;
             }
             const float prev = spk_rms_.load(std::memory_order_relaxed);
@@ -802,6 +851,7 @@ void AudioEngine::RunOutputLoop() {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
+        empty_grace_ticks = 0;
         size_t decoded_samples = 0;
         bool have_pcm = false;
         if (raw_pcm) {
@@ -817,9 +867,9 @@ void AudioEngine::RunOutputLoop() {
                     logged_first_decode = true;
                 }
             }
-        } else {
+        } else if (opus_dec_ != nullptr) {
             esp_audio_dec_in_raw_t raw = {};
-            raw.buffer = pkt.data();
+            raw.buffer = const_cast<uint8_t*>(pkt.data());
             raw.len = static_cast<uint32_t>(pkt.size());
             raw.consumed = 0;
             raw.frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE;
@@ -859,7 +909,11 @@ void AudioEngine::RunOutputLoop() {
                 playing_downlink = true;
                 idle_ticks = 0;
                 prebuf_ticks = 0;
+                empty_grace_ticks = 0;
+                playback_frames = 0;
+                playback_grace_waits = 0;
             }
+            ++playback_frames;
             last_tx_sample = dma_tx_pcm_[decoded_samples - 1];
             const float spk_lvl = ComputeNormalizedPcmRms(dma_tx_pcm_, decoded_samples);
             const float prev = spk_rms_.load(std::memory_order_relaxed);

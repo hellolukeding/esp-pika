@@ -321,18 +321,41 @@ public:
             std::lock_guard<std::mutex> lock(state_mu_);
             cur_state = state_.State();
         }
-        ESP_LOGI(kTag, "status board=%s chip=%s mac=%s state=%s free_int=%u min_int=%u",
+        ESP_LOGI(kTag,
+                 "status board=%s chip=%s mac=%s state=%s free_int=%u min_int=%u largest_int=%u free_psram=%u hwm=%u",
                  board_ ? board_->BoardName() : "none",
                  board_ ? board_->ChipName() : "none",
                  net_.DeviceMac().c_str(),
                  esp_pika::DeviceStateName(cur_state),
                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
-                 static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)));
+                 static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+                 static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
     }
 
     void TickFast(uint32_t dt_ms) {
         if (ez_direct_mode_) {
             ez_client_.TickFast(dt_ms);
+            PendingDirectTurn pending_turn;
+            bool run_pending_turn = false;
+            {
+                std::lock_guard<std::mutex> lock(speech_mu_);
+                if (has_pending_direct_turn_) {
+                    pending_turn = std::move(pending_direct_turn_);
+                    has_pending_direct_turn_ = false;
+                    run_pending_turn = true;
+                }
+            }
+            if (run_pending_turn) {
+                const bool started = StartDirectListenTurn(
+                    pending_turn.wake_source, pending_turn.speaker_id, pending_turn.speaker_role,
+                    pending_turn.speaker_score, pending_turn.play_chime,
+                    pending_turn.accept_spec_gen);
+                if (!started && pending_turn.accept_spec_gen > 0) {
+                    audio_.RejectSpeculativeWake(pending_turn.accept_spec_gen);
+                }
+            }
         } else {
             esp_pika::WakeDetectedPayload wake;
             bool send_wake = false;
@@ -381,20 +404,56 @@ public:
             return;
         }
 
-        const size_t flushed = audio_.FlushUplink([this, ez_sid](const uint8_t* frame, size_t len) {
-            if (ez_direct_mode_) {
-                if (len == 640 && ez_sid != 0) {
-                    uint32_t seq = 0;
-                    {
-                        std::lock_guard<std::mutex> lock(speech_mu_);
-                        seq = ez_uplink_seq_++;
+        bool tx_aborted = false;
+        const size_t flushed = audio_.FlushUplinkChecked(
+            [this, ez_sid](const uint8_t* frame, size_t len) -> bool {
+                if (ez_direct_mode_) {
+                    if (len == 640 && ez_sid != 0) {
+                        uint32_t seq = 0;
+                        {
+                            std::lock_guard<std::mutex> lock(speech_mu_);
+                            seq = ez_uplink_seq_;
+                        }
+                        if (!ez_client_.SendUplinkPcmFrame(ez_sid, seq, frame)) {
+                            ESP_LOGW(kTag,
+                                     "uplink PCM send failed sid=%lu seq=%lu; aborting turn",
+                                     static_cast<unsigned long>(ez_sid),
+                                     static_cast<unsigned long>(seq));
+                            return false;
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(speech_mu_);
+                            ez_uplink_seq_ = seq + 1;
+                        }
                     }
-                    ez_client_.SendUplinkPcmFrame(ez_sid, seq, frame);
+                    return true;
                 }
-            } else {
                 net_.SendBinary(frame, len);
+                return true;
+            },
+            &tx_aborted);
+        if (tx_aborted) {
+            audio_.SetUplinkEnabled(false);
+            audio_.ClearQueues();
+            {
+                std::lock_guard<std::mutex> lock(speech_mu_);
+                speech_started_ = false;
+                heard_speech_ = false;
+                speech_active_ms_ = 0;
+                silence_after_speech_ms_ = 0;
+                ez_uplink_stream_id_ = 0;
+                ez_uplink_seq_ = 0;
             }
-        });
+            if (ez_client_.IsOnline() && ez_sid != 0) {
+                ez_client_.CancelListen(ez_sid);
+            }
+            {
+                std::lock_guard<std::mutex> lock(state_mu_);
+                state_.OnSpeechStopped();
+                SyncUiEmotionLocked();
+            }
+            return;
+        }
         const bool chime_playing = audio_.IsWakeChimePlaying();
         const bool active = audio_.IsVadSpeaking() || (audio_.CleanMicLevel() >= 0.08f);
         const char* finish_reason = nullptr;
@@ -659,24 +718,37 @@ private:
             ez_seq_count = ez_uplink_seq_;
         }
         audio_.SetUplinkEnabled(false);
-        const size_t rem = audio_.FlushUplink([this, ez_sid, &ez_seq_count](const uint8_t* frame,
-                                                                            size_t len) {
-            if (ez_direct_mode_) {
-                if (len == 640 && ez_sid != 0) {
-                    ez_client_.SendUplinkPcmFrame(ez_sid, ez_seq_count++, frame);
+        bool tx_aborted = false;
+        const size_t rem = audio_.FlushUplinkChecked(
+            [this, ez_sid, &ez_seq_count](const uint8_t* frame, size_t len) -> bool {
+                if (ez_direct_mode_) {
+                    if (len == 640 && ez_sid != 0) {
+                        if (!ez_client_.SendUplinkPcmFrame(ez_sid, ez_seq_count, frame)) {
+                            ESP_LOGW(kTag,
+                                     "final uplink PCM send failed sid=%lu seq=%lu; cancelling",
+                                     static_cast<unsigned long>(ez_sid),
+                                     static_cast<unsigned long>(ez_seq_count));
+                            return false;
+                        }
+                        ++ez_seq_count;
+                    }
+                    return true;
                 }
-            } else {
                 net_.SendBinary(frame, len);
-            }
-        });
+                return true;
+            },
+            &tx_aborted);
+        if (tx_aborted) {
+            audio_.ClearQueues();
+        }
         sent_frames += rem;
         {
             std::lock_guard<std::mutex> lock(speech_mu_);
             turn_sent_frames_ = sent_frames;
             ez_uplink_seq_ = ez_seq_count;
         }
-        ESP_LOGI(kTag, "finishing speech uplink (%s); sent_frames=%u", reason,
-                 static_cast<unsigned>(sent_frames));
+        ESP_LOGI(kTag, "finishing speech uplink (%s); sent_frames=%u aborted=%d", reason,
+                 static_cast<unsigned>(sent_frames), tx_aborted ? 1 : 0);
         {
             std::lock_guard<std::mutex> lock(state_mu_);
             state_.OnSpeechStopped();
@@ -684,7 +756,7 @@ private:
         }
         if (ez_direct_mode_) {
             if (ez_sid != 0) {
-                if (ez_seq_count > 0) {
+                if (!tx_aborted && ez_seq_count > 0) {
                     ez_client_.StopListen(ez_sid, ez_seq_count - 1);
                 } else {
                     ez_client_.CancelListen(ez_sid);
@@ -784,6 +856,31 @@ private:
         }
     }
 
+    void QueueDirectListenTurn(const std::string& wake_source,
+                               const std::string& speaker_id,
+                               int speaker_role,
+                               float speaker_score,
+                               bool play_chime,
+                               uint32_t accept_spec_gen) {
+        uint32_t superseded_gen = 0;
+        {
+            std::lock_guard<std::mutex> lock(speech_mu_);
+            if (has_pending_direct_turn_ && pending_direct_turn_.accept_spec_gen > 0) {
+                superseded_gen = pending_direct_turn_.accept_spec_gen;
+            }
+            pending_direct_turn_.wake_source = wake_source;
+            pending_direct_turn_.speaker_id = speaker_id;
+            pending_direct_turn_.speaker_role = speaker_role;
+            pending_direct_turn_.speaker_score = speaker_score;
+            pending_direct_turn_.play_chime = play_chime;
+            pending_direct_turn_.accept_spec_gen = accept_spec_gen;
+            has_pending_direct_turn_ = true;
+        }
+        if (superseded_gen > 0 && superseded_gen != accept_spec_gen) {
+            audio_.RejectSpeculativeWake(superseded_gen);
+        }
+    }
+
     void HandleWakeEvent(const esp_pika::WakeEvent& evt) {
         ESP_LOGI(kTag, "wake triggered word=%s score=%.2f snr=%.1f",
                  evt.wake_word.c_str(),
@@ -806,19 +903,33 @@ private:
                 vp_engine_.SubmitWakeUtteranceAsync(std::move(job));
                 return;
             }
-            std::string spk_id;
-            int spk_role = 0;
-            float spk_score = 0.0f;
+            if (!ez_client_.IsOnline()) {
+                ui_.ShowMessage(ez_client_.IsPaired() ? "sleep" : "curious",
+                                ez_client_.IsPaired() ? "EZ ASSISTANT OFFLINE"
+                                                      : "CONNECT IN EZ ASSISTANT");
+                return;
+            }
+            if (!ez_client_.IsAsrReady()) {
+                ui_.ShowMessage("surprised", "ASR NOT CONFIGURED");
+                return;
+            }
+            // Start wake chime immediately on Core 0, then offload voiceprint inference and
+            // TLS/WSS listen_start strictly to Core 1's internal-DRAM stack (AGENTS.md §3.1).
+            audio_.ClearDownlinkQueue();
+            audio_.ClearQueues();
+            audio_.PlayWakeChime();
             if (vp_store_.Count() > 0 && !evt.wake_pcm_16k.empty()) {
-                esp_pika::VoiceprintMatch match;
-                if (vp_engine_.Identify(evt.wake_pcm_16k.data(), evt.wake_pcm_16k.size(), &match) &&
-                    match.identified) {
-                    spk_id = match.speaker_id;
-                    spk_role = static_cast<int>(match.role);
-                    spk_score = match.score;
+                esp_pika::WakeVoiceprintJob job;
+                job.wake_word = evt.wake_word;
+                job.wake_source = "wake_word";
+                job.wake_score = evt.wake_score;
+                job.snr_db = evt.snr_db;
+                job.pcm_16k = evt.wake_pcm_16k;
+                if (vp_engine_.SubmitWakeUtteranceAsync(std::move(job))) {
+                    return;
                 }
             }
-            StartDirectListenTurn("wake_word", spk_id, spk_role, spk_score, true, 0);
+            QueueDirectListenTurn("wake_word", "", 0, 0.0f, false, 0);
             return;
         }
         esp_pika::WakeDetectedPayload wake;
@@ -872,15 +983,19 @@ private:
             }
             const bool verified =
                 outcome.match.identified && (outcome.match.score >= cur_wake.vp_threshold);
+            if (outcome.job.wake_source == "wake_word") {
+                const std::string spk_id = outcome.match.identified ? outcome.match.speaker_id : "";
+                const int spk_role =
+                    outcome.match.identified ? static_cast<int>(outcome.match.role) : 0;
+                const float spk_score = outcome.match.identified ? outcome.match.score : 0.0f;
+                QueueDirectListenTurn("wake_word", spk_id, spk_role, spk_score, false, 0);
+                return;
+            }
             if (outcome.job.wake_source == "voiceprint_direct") {
                 if (verified) {
-                    const bool started = StartDirectListenTurn(
-                        "voiceprint_direct", outcome.match.speaker_id,
-                        static_cast<int>(outcome.match.role), outcome.match.score,
-                        cur_wake.vp_wake_chime, outcome.job.generation);
-                    if (!started) {
-                        audio_.RejectSpeculativeWake(outcome.job.generation);
-                    }
+                    QueueDirectListenTurn("voiceprint_direct", outcome.match.speaker_id,
+                                          static_cast<int>(outcome.match.role), outcome.match.score,
+                                          cur_wake.vp_wake_chime, outcome.job.generation);
                 } else {
                     audio_.RejectSpeculativeWake(outcome.job.generation);
                 }
@@ -888,7 +1003,7 @@ private:
             }
             if (outcome.job.wake_source == "wake_word_plus_vp") {
                 if (verified) {
-                    StartDirectListenTurn("wake_word_plus_vp", outcome.match.speaker_id,
+                    QueueDirectListenTurn("wake_word_plus_vp", outcome.match.speaker_id,
                                           static_cast<int>(outcome.match.role),
                                           outcome.match.score, true, 0);
                 } else {
@@ -949,11 +1064,23 @@ private:
         case esp_pika::EzClientState::kUnpairedReady:
             ui_.SetSessionTag("PAIR READY");
             {
-                std::lock_guard<std::mutex> lock(speech_mu_);
-                speech_started_ = false;
-                ez_uplink_stream_id_ = 0;
+                uint32_t drop_spec_gen = 0;
+                {
+                    std::lock_guard<std::mutex> lock(speech_mu_);
+                    speech_started_ = false;
+                    ez_uplink_stream_id_ = 0;
+                    ez_uplink_seq_ = 0;
+                    if (has_pending_direct_turn_) {
+                        drop_spec_gen = pending_direct_turn_.accept_spec_gen;
+                        has_pending_direct_turn_ = false;
+                    }
+                }
+                if (drop_spec_gen > 0) {
+                    audio_.RejectSpeculativeWake(drop_spec_gen);
+                }
             }
             audio_.SetUplinkEnabled(false);
+            audio_.ClearQueues();
             {
                 std::lock_guard<std::mutex> lock(ez_mu_);
                 ez_active_playback_output_id_.clear();
@@ -972,11 +1099,23 @@ private:
         case esp_pika::EzClientState::kConnecting:
             ui_.SetSessionTag("EZ:WAIT");
             {
-                std::lock_guard<std::mutex> lock(speech_mu_);
-                speech_started_ = false;
-                ez_uplink_stream_id_ = 0;
+                uint32_t drop_spec_gen = 0;
+                {
+                    std::lock_guard<std::mutex> lock(speech_mu_);
+                    speech_started_ = false;
+                    ez_uplink_stream_id_ = 0;
+                    ez_uplink_seq_ = 0;
+                    if (has_pending_direct_turn_) {
+                        drop_spec_gen = pending_direct_turn_.accept_spec_gen;
+                        has_pending_direct_turn_ = false;
+                    }
+                }
+                if (drop_spec_gen > 0) {
+                    audio_.RejectSpeculativeWake(drop_spec_gen);
+                }
             }
             audio_.SetUplinkEnabled(false);
+            audio_.ClearQueues();
             {
                 std::lock_guard<std::mutex> lock(ez_mu_);
                 ez_active_playback_output_id_.clear();
@@ -992,11 +1131,23 @@ private:
         default:
             ui_.SetSessionTag("EZ:OFF");
             {
-                std::lock_guard<std::mutex> lock(speech_mu_);
-                speech_started_ = false;
-                ez_uplink_stream_id_ = 0;
+                uint32_t drop_spec_gen = 0;
+                {
+                    std::lock_guard<std::mutex> lock(speech_mu_);
+                    speech_started_ = false;
+                    ez_uplink_stream_id_ = 0;
+                    ez_uplink_seq_ = 0;
+                    if (has_pending_direct_turn_) {
+                        drop_spec_gen = pending_direct_turn_.accept_spec_gen;
+                        has_pending_direct_turn_ = false;
+                    }
+                }
+                if (drop_spec_gen > 0) {
+                    audio_.RejectSpeculativeWake(drop_spec_gen);
+                }
             }
             audio_.SetUplinkEnabled(false);
+            audio_.ClearQueues();
             {
                 std::lock_guard<std::mutex> lock(ez_mu_);
                 ez_active_playback_output_id_.clear();
@@ -1491,8 +1642,19 @@ private:
     std::string connected_ip_;
     esp_pika::GatewayEndpoint endpoint_;
 
+    struct PendingDirectTurn {
+        std::string wake_source;
+        std::string speaker_id;
+        int speaker_role = 0;
+        float speaker_score = 0.0f;
+        bool play_chime = false;
+        uint32_t accept_spec_gen = 0;
+    };
+
     mutable std::mutex speech_mu_;
     bool speech_started_ = false;
+    bool has_pending_direct_turn_ = false;
+    PendingDirectTurn pending_direct_turn_{};
     bool heard_speech_ = false;
     uint32_t speech_active_ms_ = 0;
     uint32_t silence_after_speech_ms_ = 0;
@@ -1543,13 +1705,17 @@ extern "C" void app_main(void) {
     }
     app.LogStatus();
 
-    uint32_t fast_ticks = 0;
+    int64_t last_tick_ms = NowMillis();
+    int64_t last_housekeeping_ms = last_tick_ms;
     int seconds = 0;
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(20));
-        app.TickFast(20);
-        if (++fast_ticks >= 50) {
-            fast_ticks = 0;
+        const int64_t now_ms = NowMillis();
+        const uint32_t dt_ms = static_cast<uint32_t>(std::clamp<int64_t>(now_ms - last_tick_ms, 1, 250));
+        last_tick_ms = now_ms;
+        app.TickFast(dt_ms);
+        if (now_ms - last_housekeeping_ms >= 1000) {
+            last_housekeeping_ms = now_ms;
             app.TickHousekeeping();
             if (!app.IsOnline() && (++seconds % 10) == 0) {
                 app.LogStatus();

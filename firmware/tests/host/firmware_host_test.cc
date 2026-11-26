@@ -135,6 +135,16 @@ void TestBoundedFrameQueueBackpressure() {
     assert(q.Pop(&out) && out[0] == 4);
     assert(q.Pop(&out) && out[0] == 5);
     assert(!q.Pop(&out));
+
+    // Verify raw PushBytesDropOldest + zero-copy PopFrame path used for PSRAM PCM frames.
+    const uint8_t pcm_a[4] = {10, 20, 30, 40};
+    const uint8_t pcm_b[4] = {50, 60, 70, 80};
+    assert(q.PushBytesDropOldest(pcm_a, sizeof(pcm_a)));
+    assert(q.PushBytesDropOldest(pcm_b, sizeof(pcm_b)));
+    BoundedFrameQueue::PsramFrame frame;
+    assert(q.PopFrame(&frame) && frame.size() == 4 && frame.data()[0] == 10 && frame.data()[3] == 40);
+    assert(q.PopFrame(&frame) && frame.size() == 4 && frame.data()[0] == 50 && frame.data()[3] == 80);
+    assert(!q.PopFrame(&frame));
 }
 
 void TestLocalExecutor() {

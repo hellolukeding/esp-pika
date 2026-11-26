@@ -270,13 +270,16 @@ public:
         }
         i2s_channel_enable(tx_chan_);
 
-        esp_codec_dev_vol_map_t vol_map[2] = {
+        // Unity 0 dB at default vol=85 and capped at +3 dB at vol=100 so ES8311 DAC and the
+        // NS4150B speaker amplifier never digitally clip neural TTS peaks.
+        esp_codec_dev_vol_map_t vol_map[3] = {
             {.vol = 0, .db_value = -50.0f},
-            {.vol = 100, .db_value = 12.0f},
+            {.vol = 85, .db_value = 0.0f},
+            {.vol = 100, .db_value = 3.0f},
         };
         esp_codec_dev_vol_curve_t vol_curve = {
             .vol_map = vol_map,
-            .count = 2,
+            .count = 3,
         };
         esp_codec_dev_set_vol_curve(codec_dev_, &vol_curve);
         esp_codec_dev_set_out_mute(codec_dev_, false);

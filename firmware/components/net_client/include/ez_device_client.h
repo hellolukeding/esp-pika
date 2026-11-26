@@ -121,6 +121,7 @@ public:
 private:
     std::string NextMessageId();
     void SetState(EzClientState next);
+    void EnqueueJsonTx(std::string json_text);
     bool SendJson(const std::string& json_text);
     bool SendBinary(const uint8_t* data, size_t len);
     void HandleInboundEnvelope(const std::string& json_text);
@@ -162,6 +163,7 @@ private:
     std::vector<EzDeviceCommandRequest> pending_commands_;
     std::vector<std::string> pending_vp_syncs_;
     std::vector<EzWakeConfigSyncRequest> pending_wake_syncs_;
+    std::vector<std::string> pending_tx_json_;
 
     // Active pairing / auth handshake state protected by `mu_`
     bool ws_pairing_mode_ = false;
