@@ -1096,19 +1096,29 @@ void TestPhase3WakeConfigMultiTemplateAndSpeculativeBuffer() {
         "\"payload\":{\"sync_id\":\"wake-abc\",\"enrolled_speaker_count\":1,"
         "\"config\":{\"mode\":\"voiceprint_direct\",\"wake_word\":\"小元同学\","
         "\"wake_pinyin\":\"xiao yuan tong xue\",\"vp_threshold\":0.75,"
-        "\"min_speech_ms\":650,\"cooldown_ms\":1200,\"vp_wake_chime\":false}}}",
+        "\"min_speech_ms\":650,\"cooldown_ms\":1200,\"vp_wake_chime\":false,"
+        "\"speech_end_silence_ms\":350,\"turn_commit_delay_ms\":0}}}",
         &ws_msg));
     assert(ws_msg.type == EzInboundType::kWakeConfigSync);
     assert(ws_msg.wake_config_sync.sync_id == "wake-abc");
     assert(ws_msg.wake_config_sync.config.mode == EzWakeMode::kVoiceprintDirect);
     assert(ws_msg.wake_config_sync.config.wake_pinyin == "xiao yuan tong xue");
     assert(ws_msg.wake_config_sync.config.min_speech_ms == 650);
+    assert(ws_msg.wake_config_sync.config.speech_end_silence_ms == 350);
+    assert(ws_msg.wake_config_sync.config.turn_commit_delay_ms == 0);
 
     const std::string ack = EzBuildWakeConfigAckJson("m-wa-1", "wake-abc", true,
                                                      &ws_msg.wake_config_sync.config);
     assert(ack.find("\"type\":\"wake_config_ack\"") != std::string::npos);
     assert(ack.find("\"sync_id\":\"wake-abc\"") != std::string::npos);
     assert(ack.find("\"mode\":\"voiceprint_direct\"") != std::string::npos);
+    assert(ack.find("\"speech_end_silence_ms\":350") != std::string::npos);
+    assert(ack.find("\"turn_commit_delay_ms\":0") != std::string::npos);
+
+    EzWakeConfig clamp_cfg;
+    assert(clamp_cfg.FromJson("{\"speech_end_silence_ms\":50,\"turn_commit_delay_ms\":9999}"));
+    assert(clamp_cfg.speech_end_silence_ms == 250);
+    assert(clamp_cfg.turn_commit_delay_ms == 5000);
 
     const std::string ls = EzBuildListenStartJson("m-ls-1", "in-1", 9, EzOutputPreference::kText,
                                                   "voiceprint_direct", "spk_luke", 1, 0.91f);

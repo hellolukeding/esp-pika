@@ -184,6 +184,8 @@ void AudioEngine::SetUplinkEnabled(bool enabled) {
         !capture_active_.load(std::memory_order_acquire);
     afe_.SetWakeDetectionEnabled(allow_wake_word);
     if (!enabled) {
+        uplink_voiced_ms_.store(0, std::memory_order_relaxed);
+        uplink_silence_ms_.store(0, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(spec_mu_);
         spec_pcm_.clear();
         pending_flush_pcm_.clear();
@@ -191,6 +193,20 @@ void AudioEngine::SetUplinkEnabled(bool enabled) {
             spec_state_ == SpeculativeState::kEvaluating) {
             spec_state_ = SpeculativeState::kIdle;
         }
+    }
+}
+
+void AudioEngine::ResetUplinkVadState(uint32_t initial_voiced_ms) {
+    uplink_voiced_ms_.store(initial_voiced_ms, std::memory_order_relaxed);
+    uplink_silence_ms_.store(0, std::memory_order_relaxed);
+}
+
+void AudioEngine::GetUplinkVadState(uint32_t* voiced_ms, uint32_t* silence_ms) const {
+    if (voiced_ms != nullptr) {
+        *voiced_ms = uplink_voiced_ms_.load(std::memory_order_relaxed);
+    }
+    if (silence_ms != nullptr) {
+        *silence_ms = uplink_silence_ms_.load(std::memory_order_relaxed);
     }
 }
 
@@ -609,6 +625,7 @@ void AudioEngine::RunInputLoop() {
     };
 
     uint32_t loop_count = 0;
+    bool uplink_turn_has_audio = false;
     while (running_.load()) {
         size_t read = codec_->ReadPcm(dma_rx_pcm_, rx_samples, 100);
         const bool log_diag = ((++loop_count % 50) == 0);
@@ -645,6 +662,9 @@ void AudioEngine::RunInputLoop() {
             AfeStepResult muted_step;
             ProcessCapturedPcm(dma_rx_pcm_, read, &muted_step);
             clean_mic_rms_.store(0.0f, std::memory_order_relaxed);
+            uplink_voiced_ms_.store(0, std::memory_order_relaxed);
+            uplink_silence_ms_.store(0, std::memory_order_relaxed);
+            uplink_turn_has_audio = false;
             if (log_diag) {
                 ESP_LOGI(kTag, "mic diag: read=%u rms=%.4f clean=%.4f vad=0 min=%d max=%d uplink=%d sent_frames=%lu",
                          static_cast<unsigned>(read),
@@ -666,6 +686,7 @@ void AudioEngine::RunInputLoop() {
             mic_rms_.store(0.0f, std::memory_order_relaxed);
             clean_mic_rms_.store(0.0f, std::memory_order_relaxed);
             uplink_pcm_buf.clear();
+            uplink_turn_has_audio = false;
             if (log_diag) {
                 ESP_LOGI(kTag, "mic diag: read=%u rms=0.0000 clean=0.0000 vad=0 min=%d max=%d uplink=0 sent_frames=%lu",
                          static_cast<unsigned>(read),
@@ -697,18 +718,35 @@ void AudioEngine::RunInputLoop() {
         }
         if (!uplink_enabled_.load()) {
             uplink_pcm_buf.clear();
+            uplink_turn_has_audio = false;
             continue;
+        }
+        // Track speech/silence on Core 0 at deterministic frame cadence so Core 1 UI/WSS work
+        // can never starve VAD end-of-speech detection into a 5.5s no_speech_timeout.
+        const uint32_t frame_ms =
+            static_cast<uint32_t>((read * 1000U) / std::max<uint32_t>(cfg_.uplink_sample_rate, 1U));
+        const bool speech_active =
+            step.vad_speaking || (clean_mic_rms_.load(std::memory_order_relaxed) >= 0.08f);
+        if (speech_active) {
+            uplink_voiced_ms_.fetch_add(frame_ms, std::memory_order_relaxed);
+            uplink_silence_ms_.store(0, std::memory_order_relaxed);
+        } else if (uplink_voiced_ms_.load(std::memory_order_relaxed) >= 120U) {
+            uplink_silence_ms_.fetch_add(frame_ms, std::memory_order_relaxed);
         }
         std::vector<int16_t> spec_flush;
         if (TakePendingSpeculativePcm(&spec_flush)) {
             uplink_pcm_buf.insert(uplink_pcm_buf.end(), spec_flush.begin(), spec_flush.end());
-        } else if (step.vad_started && !step.pre_roll_pcm.empty()) {
+            uplink_turn_has_audio = true;
+        } else if (!uplink_turn_has_audio && step.vad_started && !step.pre_roll_pcm.empty()) {
+            // Only prepend pre-roll before continuous uplink starts; never duplicate audio mid-turn.
             uplink_pcm_buf.insert(uplink_pcm_buf.end(), step.pre_roll_pcm.begin(),
                                   step.pre_roll_pcm.end());
+            uplink_turn_has_audio = true;
         }
         if (!step.clean_pcm.empty()) {
             uplink_pcm_buf.insert(uplink_pcm_buf.end(), step.clean_pcm.begin(),
                                   step.clean_pcm.end());
+            uplink_turn_has_audio = true;
         }
         bool encoded = false;
         if (TransportCodec() == AudioTransportCodec::kPcm16_20ms) {

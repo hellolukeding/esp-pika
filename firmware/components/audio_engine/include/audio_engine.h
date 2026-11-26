@@ -148,6 +148,11 @@ public:
     float MicLevel() const { return mic_rms_.load(std::memory_order_relaxed); }
     float CleanMicLevel() const { return clean_mic_rms_.load(std::memory_order_relaxed); }
     float SpeakerLevel() const { return spk_rms_.load(std::memory_order_relaxed); }
+    /// Resets Core-0 frame-accurate uplink VAD speech/silence accumulators at turn start.
+    void ResetUplinkVadState(uint32_t initial_voiced_ms = 0);
+    /// Reads Core-0 accumulated voiced & trailing-silence durations (ms) for the active turn.
+    void GetUplinkVadState(uint32_t* voiced_ms, uint32_t* silence_ms) const;
+
     bool IsVadSpeaking() const { return vad_speaking_.load(std::memory_order_relaxed); }
     bool IsWakeChimePlaying() const {
         return wake_chime_playing_.load(std::memory_order_acquire) ||
@@ -189,6 +194,8 @@ private:
     std::atomic<float> clean_mic_rms_{0.0f};
     std::atomic<float> spk_rms_{0.0f};
     std::atomic<bool> vad_speaking_{false};
+    std::atomic<uint32_t> uplink_voiced_ms_{0};
+    std::atomic<uint32_t> uplink_silence_ms_{0};
 
     // Speculative PSRAM utterance buffer for zero-word-loss voiceprint-direct wake.
     mutable std::mutex spec_mu_;

@@ -455,7 +455,21 @@ public:
             return;
         }
         const bool chime_playing = audio_.IsWakeChimePlaying();
-        const bool active = audio_.IsVadSpeaking() || (audio_.CleanMicLevel() >= 0.08f);
+        uint32_t core0_voiced_ms = 0;
+        uint32_t core0_silence_ms = 0;
+        audio_.GetUplinkVadState(&core0_voiced_ms, &core0_silence_ms);
+        uint32_t end_silence_cfg_ms = 500U;
+        {
+            std::lock_guard<std::mutex> lock(wake_mu_);
+            end_silence_cfg_ms = wake_cfg_.speech_end_silence_ms;
+        }
+        // ESP-SR AFE holds VAD_SPEECH for vad_min_noise_ms (200ms) after voice drops; subtract it
+        // so total user-perceived pause matches the configured speech_end_silence_ms.
+        constexpr uint32_t kAfeVadMinNoiseMs = 200U;
+        const uint32_t extra_silence_target_ms =
+            (end_silence_cfg_ms > kAfeVadMinNoiseMs)
+                ? std::max<uint32_t>(end_silence_cfg_ms - kAfeVadMinNoiseMs, 60U)
+                : 60U;
         const char* finish_reason = nullptr;
         {
             std::lock_guard<std::mutex> lock(speech_mu_);
@@ -470,19 +484,14 @@ public:
                 silence_after_speech_ms_ = 0;
             } else {
                 const int64_t clean_elapsed_ms = NowMillis() - uplink_started_ms_;
-                if (clean_elapsed_ms >= 40) {
-                    if (active) {
-                        speech_active_ms_ += dt_ms;
-                        silence_after_speech_ms_ = 0;
-                        if (speech_active_ms_ >= 180) {
-                            heard_speech_ = true;
-                        }
-                    } else if (heard_speech_) {
-                        silence_after_speech_ms_ += dt_ms;
-                        if (silence_after_speech_ms_ >= 260) {
-                            finish_reason = "vad_end";
-                        }
-                    }
+                speech_active_ms_ = std::max(speech_active_ms_, core0_voiced_ms);
+                silence_after_speech_ms_ = core0_silence_ms;
+                if (speech_active_ms_ >= 120U) {
+                    heard_speech_ = true;
+                }
+                if (clean_elapsed_ms >= 40 && heard_speech_ &&
+                    silence_after_speech_ms_ >= extra_silence_target_ms) {
+                    finish_reason = "vad_end";
                 }
                 if (finish_reason == nullptr && !heard_speech_ && clean_elapsed_ms >= 5500) {
                     finish_reason = "no_speech_timeout";
@@ -703,6 +712,8 @@ private:
         size_t sent_frames = 0;
         uint32_t ez_sid = 0;
         uint32_t ez_seq_count = 0;
+        uint32_t logged_voiced_ms = 0;
+        uint32_t logged_silence_ms = 0;
         {
             std::lock_guard<std::mutex> lock(speech_mu_);
             if (!speech_started_) {
@@ -710,6 +721,8 @@ private:
             }
             speech_started_ = false;
             heard_speech_ = false;
+            logged_voiced_ms = speech_active_ms_;
+            logged_silence_ms = silence_after_speech_ms_;
             speech_active_ms_ = 0;
             silence_after_speech_ms_ = 0;
             sent_frames = turn_sent_frames_;
@@ -747,8 +760,12 @@ private:
             turn_sent_frames_ = sent_frames;
             ez_uplink_seq_ = ez_seq_count;
         }
-        ESP_LOGI(kTag, "finishing speech uplink (%s); sent_frames=%u aborted=%d", reason,
-                 static_cast<unsigned>(sent_frames), tx_aborted ? 1 : 0);
+        ESP_LOGI(kTag,
+                 "finishing speech uplink (%s); sent_frames=%u voiced_ms=%lu silence_ms=%lu aborted=%d",
+                 reason, static_cast<unsigned>(sent_frames),
+                 static_cast<unsigned long>(logged_voiced_ms),
+                 static_cast<unsigned long>(logged_silence_ms),
+                 tx_aborted ? 1 : 0);
         {
             std::lock_guard<std::mutex> lock(state_mu_);
             state_.OnSpeechStopped();
@@ -815,11 +832,17 @@ private:
                 return false;
             }
         }
+        uint32_t init_voiced_ms = 0;
+        if (accept_spec_gen > 0) {
+            std::lock_guard<std::mutex> lock(wake_mu_);
+            init_voiced_ms = wake_cfg_.min_speech_ms;
+        }
+        audio_.ResetUplinkVadState(init_voiced_ms);
         {
             std::lock_guard<std::mutex> lock(speech_mu_);
             speech_started_ = true;
             heard_speech_ = (accept_spec_gen > 0);
-            speech_active_ms_ = (accept_spec_gen > 0) ? wake_cfg_.min_speech_ms : 0;
+            speech_active_ms_ = init_voiced_ms;
             silence_after_speech_ms_ = 0;
             turn_sent_frames_ = 0;
             logged_first_rx_audio_ = false;
@@ -1475,9 +1498,12 @@ private:
         }
         const bool saved = next.SaveToNvs();
         ez_client_.SetWakeConfig(next, audio_.IsMultiNetReady());
-        ESP_LOGI(kTag, "ez wake_config_sync applied mode=%s word='%s' pinyin='%s' th=%.2f saved=%d",
+        ESP_LOGI(kTag,
+                 "ez wake_config_sync applied mode=%s word='%s' pinyin='%s' th=%.2f end_silence=%lums commit_delay=%lums saved=%d",
                  esp_pika::EzWakeModeWireName(next.mode), next.wake_word.c_str(),
                  next.wake_pinyin.c_str(), static_cast<double>(next.vp_threshold),
+                 static_cast<unsigned long>(next.speech_end_silence_ms),
+                 static_cast<unsigned long>(next.turn_commit_delay_ms),
                  saved ? 1 : 0);
         ez_client_.SendWakeConfigAck(sync.sync_id, saved, &next, saved ? "" : "nvs_save_failed");
     }
@@ -1564,6 +1590,7 @@ private:
                 std::lock_guard<std::mutex> lock(speech_mu_);
                 speech_started_ = true;
             }
+            audio_.ResetUplinkVadState(0);
             audio_.SetUplinkEnabled(true);
             break;
         }
@@ -1696,6 +1723,9 @@ private:
 
 #ifdef ESP_PLATFORM
 extern "C" void app_main(void) {
+    // Keep app_main (Core 1 state machine & WSS uplink pump) above UiRenderTask (prio 3)
+    // so 3D avatar rendering never stalls PCM streaming or VAD housekeeping.
+    vTaskPrioritySet(nullptr, 4);
     ESP_ERROR_CHECK(InitNvs());
 
     static FirmwareApp app;

@@ -179,7 +179,7 @@ bool AfePipeline::Init(const AfePipelineConfig& cfg) {
     afe_cfg->vad_init = cfg_.enable_vadnet;
     afe_cfg->vad_mode = VAD_MODE_3;
     afe_cfg->vad_min_speech_ms = 120;
-    afe_cfg->vad_min_noise_ms = 320;
+    afe_cfg->vad_min_noise_ms = 200;
     afe_cfg->vad_energy_threshold = -42.0f;
     afe_cfg->agc_init = true;
     afe_cfg->agc_mode = AFE_AGC_MODE_WEBRTC;

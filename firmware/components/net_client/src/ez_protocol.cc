@@ -325,13 +325,16 @@ bool EzParseWakeMode(const std::string& wire, EzWakeMode* out) {
 }
 
 std::string EzWakeConfig::ToJson() const {
-    char num_buf[128] = {};
+    char num_buf[256] = {};
     std::snprintf(num_buf, sizeof(num_buf),
-                  ",\"vp_threshold\":%.3f,\"min_speech_ms\":%lu,\"cooldown_ms\":%lu,\"vp_wake_chime\":%s",
+                  ",\"vp_threshold\":%.3f,\"min_speech_ms\":%lu,\"cooldown_ms\":%lu,"
+                  "\"vp_wake_chime\":%s,\"speech_end_silence_ms\":%lu,\"turn_commit_delay_ms\":%lu",
                   static_cast<double>(vp_threshold),
                   static_cast<unsigned long>(min_speech_ms),
                   static_cast<unsigned long>(cooldown_ms),
-                  vp_wake_chime ? "true" : "false");
+                  vp_wake_chime ? "true" : "false",
+                  static_cast<unsigned long>(speech_end_silence_ms),
+                  static_cast<unsigned long>(turn_commit_delay_ms));
     std::string out = "{";
     out += "\"mode\":\"" + std::string(EzWakeModeWireName(mode)) + "\"";
     out += ",\"wake_word\":\"" + EscapeJsonString(wake_word) + "\"";
@@ -377,6 +380,12 @@ bool EzWakeConfig::FromJson(const std::string& json_text) {
     bool chime = false;
     if (ExtractJsonBoolField(json_text, "vp_wake_chime", &chime)) {
         parsed.vp_wake_chime = chime;
+    }
+    if (ExtractJsonIntField(json_text, "speech_end_silence_ms", &ms) && ms > 0) {
+        parsed.speech_end_silence_ms = static_cast<uint32_t>(std::clamp<int64_t>(ms, 250, 2500));
+    }
+    if (ExtractJsonIntField(json_text, "turn_commit_delay_ms", &ms) && ms >= 0) {
+        parsed.turn_commit_delay_ms = static_cast<uint32_t>(std::clamp<int64_t>(ms, 0, 5000));
     }
     *this = std::move(parsed);
     return true;

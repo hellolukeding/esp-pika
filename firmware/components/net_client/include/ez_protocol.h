@@ -112,6 +112,8 @@ struct EzWakeConfig {
     uint32_t min_speech_ms = 700;
     uint32_t cooldown_ms = 1500;
     bool vp_wake_chime = false;
+    uint32_t speech_end_silence_ms = 500;
+    uint32_t turn_commit_delay_ms = 0;
 
     std::string ToJson() const;
     bool FromJson(const std::string& json_text);
