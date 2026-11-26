@@ -33,6 +33,11 @@ void UiService::SetEzUnpairCallback(std::function<void()> cb) {
     on_ez_unpair_ = std::move(cb);
 }
 
+void UiService::SetBargeInCallback(std::function<bool()> cb) {
+    std::lock_guard<std::mutex> lock(mu_);
+    on_tap_barge_in_ = std::move(cb);
+}
+
 bool UiService::Start(Board* board, AudioEngine* audio, std::function<void()> on_wake_trigger) {
     if (running_.load() || board == nullptr || board->Display() == nullptr) {
         return false;
@@ -48,10 +53,12 @@ bool UiService::Start(Board* board, AudioEngine* audio, std::function<void()> on
 
     UiWifiCallbacks wifi_cbs;
     std::function<void()> ez_unpair_cb;
+    std::function<bool()> tap_barge_in_cb;
     {
         std::lock_guard<std::mutex> lock(mu_);
         wifi_cbs = wifi_callbacks_;
         ez_unpair_cb = on_ez_unpair_;
+        tap_barge_in_cb = on_tap_barge_in_;
     }
 
     UiCallbacks cbs;
@@ -70,6 +77,7 @@ bool UiService::Start(Board* board, AudioEngine* audio, std::function<void()> on
             on_wake_trigger_();
         }
     };
+    cbs.on_tap_barge_in = std::move(tap_barge_in_cb);
     cbs.on_wifi_scan = std::move(wifi_cbs.on_scan);
     cbs.on_wifi_connect = std::move(wifi_cbs.on_connect);
     cbs.on_wifi_forget = std::move(wifi_cbs.on_forget);

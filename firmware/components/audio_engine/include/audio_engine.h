@@ -56,6 +56,7 @@ struct VoiceprintCandidateEvent {
     uint32_t generation = 0;
     uint32_t voiced_ms = 0;
     float snr_db = 0.0f;
+    bool during_playback = false;
     std::vector<int16_t> pcm_16k;
 };
 
@@ -129,6 +130,13 @@ public:
 
     /// Clears only buffered downlink frames (e.g. barge-in playback_cancel) without touching uplink.
     void ClearDownlinkQueue();
+    /// Immediately aborts active downlink playback with a click-free fade-out (<20ms barge-in).
+    void CancelDownlinkPlayback();
+    /// Returns true while downlink TTS playback is active or buffered.
+    bool IsDownlinkPlaying() const {
+        return downlink_playing_.load(std::memory_order_acquire) ||
+               (decode_queue_ != nullptr && decode_queue_->Size() > 0);
+    }
 
     /// Triggers an immediate local ascending wake-confirmation chime on Core 0.
     void PlayWakeChime();
@@ -189,6 +197,8 @@ private:
     std::atomic<int> transport_codec_{static_cast<int>(AudioTransportCodec::kOpus60ms)};
     std::atomic<bool> wake_chime_pending_{false};
     std::atomic<bool> wake_chime_playing_{false};
+    std::atomic<bool> downlink_playing_{false};
+    std::atomic<bool> downlink_abort_requested_{false};
     std::atomic<uint32_t> skip_uplink_samples_{0};
     std::atomic<float> mic_rms_{0.0f};
     std::atomic<float> clean_mic_rms_{0.0f};

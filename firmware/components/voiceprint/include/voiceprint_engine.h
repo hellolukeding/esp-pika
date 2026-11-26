@@ -49,6 +49,7 @@ struct WakeVoiceprintJob {
     std::vector<int16_t> pcm_16k;
     std::string wake_source;
     uint32_t generation = 0;
+    bool during_playback = false;
 };
 
 struct WakeVoiceprintOutcome {

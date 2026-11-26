@@ -73,6 +73,7 @@ struct UiCallbacks {
     std::function<void(int volume)> on_volume_change;
     std::function<void(uint8_t brightness)> on_brightness_change;
     std::function<void()> on_long_press_wake;
+    std::function<bool()> on_tap_barge_in;
     std::function<void(AvatarEmotion emotion)> on_quick_emotion;
     std::function<void()> on_wifi_scan;
     std::function<void(const std::string& ssid, const std::string& password, bool use_saved)>

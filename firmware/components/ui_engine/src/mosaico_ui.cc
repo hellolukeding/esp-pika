@@ -507,6 +507,10 @@ void MosaicoUi::OnTouch(const TouchPoint& tp, int64_t now_ms, UiSnapshot* mutabl
                 return;
             }
             const bool near_orb = (std::abs(cur_x_ - 240) < 105 && std::abs(cur_y_ - 228) < 105);
+            if (near_orb && callbacks_.on_tap_barge_in && callbacks_.on_tap_barge_in()) {
+                last_tap_ms_ = 0;
+                return;
+            }
             const bool is_double_tap =
                 near_orb && (last_tap_ms_ > 0) && (now_ms - last_tap_ms_ <= 380) &&
                 (std::abs(cur_x_ - last_tap_x_) < 60 && std::abs(cur_y_ - last_tap_y_) < 60);

@@ -1209,6 +1209,27 @@ void TestPhase3WakeConfigMultiTemplateAndSpeculativeBuffer() {
     assert(!engine.IsUplinkEnabled());
     std::vector<int16_t> empty_flush;
     assert(!engine.TakePendingSpeculativePcm(&empty_flush));
+
+    // 4. Barge-in during active downlink playback: candidate carries during_playback=true and
+    //    CancelDownlinkPlayback clears queued audio immediately.
+    uint8_t dummy_pcm[640] = {};
+    assert(engine.EnqueueDownlinkPcm16(dummy_pcm, sizeof(dummy_pcm)));
+    assert(engine.IsDownlinkPlaying());
+    candidates.clear();
+    // Advance past cooldown (1200ms -> 25 * 60ms = 1500ms) with silence, then speak loudly.
+    for (int f = 0; f < 25; ++f) {
+        AfeStepResult step;
+        engine.ProcessCapturedPcm(silence.data(), silence.size(), &step);
+    }
+    for (int f = 0; f < 10; ++f) {
+        AfeStepResult step;
+        engine.ProcessCapturedPcm(loud.data(), loud.size(), &step);
+    }
+    assert(candidates.size() == 1);
+    assert(candidates[0].during_playback);
+    engine.CancelDownlinkPlayback();
+    assert(!engine.IsDownlinkPlaying());
+    assert(engine.DownlinkQueueSize() == 0);
     engine.Stop();
 }
 

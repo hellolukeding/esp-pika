@@ -51,6 +51,7 @@ public:
 
     void SetWifiCallbacks(UiWifiCallbacks callbacks);
     void SetEzUnpairCallback(std::function<void()> cb);
+    void SetBargeInCallback(std::function<bool()> cb);
     bool Start(Board* board, AudioEngine* audio, std::function<void()> on_wake_trigger = nullptr);
     void Stop();
 
@@ -78,6 +79,7 @@ private:
     AudioEngine* audio_ = nullptr;
     std::function<void()> on_wake_trigger_;
     std::function<void()> on_ez_unpair_;
+    std::function<bool()> on_tap_barge_in_;
     UiWifiCallbacks wifi_callbacks_;
     MosaicoUi ui_;
     std::atomic<bool> running_{false};

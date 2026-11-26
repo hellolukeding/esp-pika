@@ -256,6 +256,7 @@ public:
             }
         };
         ui_.SetWifiCallbacks(std::move(wifi_cbs));
+        ui_.SetBargeInCallback([this]() { return HandleTouchBargeIn(); });
         ui_.Start(board_.get(), &audio_, [this]() { audio_.TriggerWakeForTest(0.95f, 18.0f); });
         if (ez_direct_mode_) {
             ui_.SetEzStatus(true, ez_client_.IsPaired(), false,
@@ -337,6 +338,27 @@ public:
     void TickFast(uint32_t dt_ms) {
         if (ez_direct_mode_) {
             ez_client_.TickFast(dt_ms);
+            if (pending_barge_in_cancel_.exchange(false, std::memory_order_acq_rel)) {
+                std::string active_out;
+                uint32_t active_sid = 0;
+                {
+                    std::lock_guard<std::mutex> lock(ez_mu_);
+                    active_out = std::move(ez_active_playback_output_id_);
+                    active_sid = ez_active_playback_stream_id_;
+                    ez_active_playback_output_id_.clear();
+                    ez_active_playback_stream_id_ = 0;
+                }
+                if (ez_client_.IsOnline()) {
+                    ez_client_.CancelPlayback(active_out, active_sid);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(state_mu_);
+                    if (state_.State() == esp_pika::DeviceState::kSpeaking) {
+                        state_.OnPlaybackFinished();
+                        SyncUiEmotionLocked();
+                    }
+                }
+            }
             PendingDirectTurn pending_turn;
             bool run_pending_turn = false;
             {
@@ -809,10 +831,11 @@ private:
             ez_active_playback_output_id_.clear();
             ez_active_playback_stream_id_ = 0;
         }
-        if (active_sid != 0 && !active_out.empty()) {
+        const bool was_speaking = audio_.IsDownlinkPlaying() || (active_sid != 0);
+        if (was_speaking) {
             ez_client_.CancelPlayback(active_out, active_sid);
         }
-        audio_.ClearDownlinkQueue();
+        audio_.CancelDownlinkPlayback();
         if (accept_spec_gen == 0) {
             audio_.ClearQueues();
         }
@@ -862,6 +885,26 @@ private:
         return true;
     }
 
+    bool HandleTouchBargeIn() {
+        bool speaking = audio_.IsDownlinkPlaying();
+        if (!speaking) {
+            std::lock_guard<std::mutex> lock(ez_mu_);
+            speaking = (ez_active_playback_stream_id_ != 0);
+        }
+        if (!speaking) {
+            std::lock_guard<std::mutex> lock(state_mu_);
+            speaking = (state_.State() == esp_pika::DeviceState::kSpeaking);
+        }
+        if (!speaking) {
+            return false;
+        }
+        ESP_LOGI(kTag, "touch barge-in triggered; stopping active TTS playback");
+        audio_.CancelDownlinkPlayback();
+        pending_barge_in_cancel_.store(true, std::memory_order_release);
+        ui_.ShowMessage("idle", "已打断");
+        return true;
+    }
+
     void HandleVoiceprintCandidate(const esp_pika::VoiceprintCandidateEvent& cand) {
         if (!ez_direct_mode_ || vp_store_.Count() == 0) {
             audio_.RejectSpeculativeWake(cand.generation);
@@ -871,6 +914,7 @@ private:
         job.wake_word = "voiceprint_direct";
         job.wake_source = "voiceprint_direct";
         job.generation = cand.generation;
+        job.during_playback = cand.during_playback;
         job.wake_score = 1.0f;
         job.snr_db = cand.snr_db;
         job.pcm_16k = cand.pcm_16k;
@@ -936,9 +980,9 @@ private:
                 ui_.ShowMessage("surprised", "ASR NOT CONFIGURED");
                 return;
             }
-            // Start wake chime immediately on Core 0, then offload voiceprint inference and
-            // TLS/WSS listen_start strictly to Core 1's internal-DRAM stack (AGENTS.md §3.1).
-            audio_.ClearDownlinkQueue();
+            // Start wake chime immediately on Core 0, abort any active TTS cleanly, then offload
+            // voiceprint inference and TLS/WSS listen_start strictly to Core 1 (AGENTS.md §3.1).
+            audio_.CancelDownlinkPlayback();
             audio_.ClearQueues();
             audio_.PlayWakeChime();
             if (vp_store_.Count() > 0 && !evt.wake_pcm_16k.empty()) {
@@ -1004,8 +1048,12 @@ private:
                 std::lock_guard<std::mutex> lock(wake_mu_);
                 cur_wake = wake_cfg_;
             }
+            const float effective_th =
+                (outcome.job.during_playback && outcome.job.wake_source == "voiceprint_direct")
+                    ? std::min(0.90f, cur_wake.vp_threshold + 0.04f)
+                    : cur_wake.vp_threshold;
             const bool verified =
-                outcome.match.identified && (outcome.match.score >= cur_wake.vp_threshold);
+                outcome.match.identified && (outcome.match.score >= effective_th);
             if (outcome.job.wake_source == "wake_word") {
                 const std::string spk_id = outcome.match.identified ? outcome.match.speaker_id : "";
                 const int spk_role =
@@ -1265,8 +1313,19 @@ private:
                 matched = true;
             }
         }
-        if (matched && reason == "cancelled") {
-            audio_.ClearDownlinkQueue();
+        if (reason != "completed" &&
+            (matched || reason == "interrupted_by_input" || reason == "cancelled")) {
+            audio_.CancelDownlinkPlayback();
+            {
+                std::lock_guard<std::mutex> lock(state_mu_);
+                if (state_.State() == esp_pika::DeviceState::kSpeaking) {
+                    state_.OnPlaybackFinished();
+                    SyncUiEmotionLocked();
+                }
+            }
+            if (reason == "interrupted_by_input" || reason == "cancelled") {
+                ui_.ShowMessage("idle", "已打断");
+            }
         }
     }
 
@@ -1700,6 +1759,7 @@ private:
     mutable std::mutex ez_mu_;
     std::string ez_active_playback_output_id_;
     uint32_t ez_active_playback_stream_id_ = 0;
+    std::atomic<bool> pending_barge_in_cancel_{false};
 
     mutable std::mutex wake_mu_;
     esp_pika::EzWakeConfig wake_cfg_;

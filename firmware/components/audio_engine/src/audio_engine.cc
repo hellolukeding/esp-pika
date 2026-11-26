@@ -363,14 +363,14 @@ void AudioEngine::UpdateSpeculativeVoiceprint(const AfeStepResult& step, uint32_
         return;
     }
     const bool speaker_playing =
-        (decode_queue_ != nullptr && decode_queue_->Size() > 0) ||
-        (spk_rms_.load(std::memory_order_relaxed) > 0.01f);
-    if (speaker_playing) {
-        return;
-    }
+        IsDownlinkPlaying() || (spk_rms_.load(std::memory_order_relaxed) > 0.01f);
 
     constexpr size_t kMaxSpecSamples = 40000U; // 2.5s @ 16kHz (~80KB in PSRAM)
-    constexpr float kMinSpecSnrDb = 5.0f;
+    // Require stronger clean-mic energy & SNR while TTS is playing so residual echo after AEC
+    // cannot self-trigger voiceprint_direct barge-in.
+    const float min_spec_snr_db = speaker_playing ? 8.0f : 5.0f;
+    const bool clean_loud_enough =
+        !speaker_playing || (clean_mic_rms_.load(std::memory_order_relaxed) >= 0.06f);
     const uint32_t min_speech_ms = vp_min_speech_ms_.load(std::memory_order_relaxed);
 
     bool emit_candidate = false;
@@ -390,7 +390,7 @@ void AudioEngine::UpdateSpeculativeVoiceprint(const AfeStepResult& step, uint32_
             break;
 
         case SpeculativeState::kIdle:
-            if (step.vad_started || step.vad_speaking) {
+            if ((step.vad_started || step.vad_speaking) && clean_loud_enough) {
                 spec_pcm_.clear();
                 spec_pcm_.reserve(kMaxSpecSamples);
                 if (!step.pre_roll_pcm.empty()) {
@@ -414,17 +414,18 @@ void AudioEngine::UpdateSpeculativeVoiceprint(const AfeStepResult& step, uint32_
                 spec_pcm_.insert(spec_pcm_.end(), step.clean_pcm.begin(),
                                  step.clean_pcm.begin() + static_cast<std::ptrdiff_t>(n));
             }
-            if (step.vad_speaking) {
+            if (step.vad_speaking && clean_loud_enough) {
                 spec_voiced_ms_ += frame_ms;
             }
             const bool enough_streaming = (spec_voiced_ms_ >= min_speech_ms);
             const bool enough_short_turn = (step.vad_ended && spec_voiced_ms_ >= 500U);
-            if ((enough_streaming || enough_short_turn) && step.snr_db >= kMinSpecSnrDb) {
+            if ((enough_streaming || enough_short_turn) && step.snr_db >= min_spec_snr_db) {
                 spec_gen_ = (spec_gen_ == 0) ? 1 : (spec_gen_ + 1);
                 spec_state_ = SpeculativeState::kEvaluating;
                 cand.generation = spec_gen_;
                 cand.voiced_ms = spec_voiced_ms_;
                 cand.snr_db = step.snr_db;
+                cand.during_playback = speaker_playing;
                 cand.pcm_16k = spec_pcm_;
                 emit_candidate = true;
             } else if (step.vad_ended) {
@@ -529,6 +530,15 @@ void AudioEngine::ClearDownlinkQueue() {
     if (decode_queue_) {
         decode_queue_->Clear();
     }
+}
+
+void AudioEngine::CancelDownlinkPlayback() {
+    downlink_abort_requested_.store(true, std::memory_order_release);
+    if (decode_queue_) {
+        decode_queue_->Clear();
+    }
+    downlink_playing_.store(false, std::memory_order_release);
+    spk_rms_.store(0.0f, std::memory_order_relaxed);
 }
 
 void AudioEngine::PlayWakeChime() {
@@ -678,27 +688,11 @@ void AudioEngine::RunInputLoop() {
             uplink_pcm_buf.clear();
             continue;
         }
-        const bool speaker_playing =
-            (decode_queue_ != nullptr && decode_queue_->Size() > 0) ||
-            (spk_rms_.load(std::memory_order_relaxed) > 0.01f);
-        if (speaker_playing && !uplink_enabled_.load(std::memory_order_relaxed)) {
-            afe_.SetWakeDetectionEnabled(false);
-            mic_rms_.store(0.0f, std::memory_order_relaxed);
-            clean_mic_rms_.store(0.0f, std::memory_order_relaxed);
-            uplink_pcm_buf.clear();
-            uplink_turn_has_audio = false;
-            if (log_diag) {
-                ESP_LOGI(kTag, "mic diag: read=%u rms=0.0000 clean=0.0000 vad=0 min=%d max=%d uplink=0 sent_frames=%lu",
-                         static_cast<unsigned>(read),
-                         static_cast<int>(raw_min_s),
-                         static_cast<int>(raw_max_s),
-                         static_cast<unsigned long>(sent_frames));
-            }
-            continue;
-        }
+        // Keep ESP-SR AEC ("MR" reference path), MultiNet7 wake word, and voiceprint barge-in
+        // continuously active during TTS playback so the user can interrupt long replies anytime.
         const bool wake_word_enabled =
             (WakeMode() != AudioWakeMode::kVoiceprintDirect) &&
-            !uplink_enabled_.load(std::memory_order_relaxed) && !speaker_playing &&
+            !uplink_enabled_.load(std::memory_order_relaxed) &&
             !capture_active_.load(std::memory_order_relaxed);
         afe_.SetWakeDetectionEnabled(wake_word_enabled);
         AfeStepResult step;
@@ -786,9 +780,45 @@ void AudioEngine::RunOutputLoop() {
     uint32_t playback_frames = 0;
     uint32_t playback_grace_waits = 0;
     while (running_.load()) {
+        if (downlink_abort_requested_.exchange(false, std::memory_order_acq_rel)) {
+            decode_queue_->Clear();
+            if (playing_downlink) {
+                constexpr size_t kRampSamples = 64;
+                constexpr size_t kTailZeros = 320;
+                const size_t ramp_out_samples =
+                    std::min<size_t>(kRampSamples + kTailZeros, tx_max_samples_);
+                const size_t ramp_n = std::min<size_t>(kRampSamples, ramp_out_samples);
+                for (size_t i = 0; i < ramp_n; ++i) {
+                    const float gain =
+                        1.0f - (static_cast<float>(i + 1) / static_cast<float>(ramp_n));
+                    dma_tx_pcm_[i] =
+                        static_cast<int16_t>(static_cast<float>(last_tx_sample) * gain);
+                }
+                if (ramp_out_samples > ramp_n) {
+                    std::memset(dma_tx_pcm_ + ramp_n, 0,
+                                (ramp_out_samples - ramp_n) * sizeof(int16_t));
+                }
+                codec_->WritePcm(dma_tx_pcm_, ramp_out_samples, 100);
+                if (cfg_.afe.enable_aec && aec_ref_ring_) {
+                    aec_ref_ring_->PushSamples(dma_tx_pcm_, ramp_out_samples);
+                }
+                ESP_LOGI(kTag, "downlink playback aborted (barge-in): frames=%lu",
+                         static_cast<unsigned long>(playback_frames));
+            }
+            playing_downlink = false;
+            downlink_playing_.store(false, std::memory_order_release);
+            spk_rms_.store(0.0f, std::memory_order_relaxed);
+            last_tx_sample = 0;
+            prebuf_ticks = 0;
+            empty_grace_ticks = 0;
+            playback_frames = 0;
+            playback_grace_waits = 0;
+            idle_ticks = 0;
+        }
         if (wake_chime_pending_.exchange(false, std::memory_order_acq_rel)) {
             if (decode_queue_->Size() == 0) {
                 playing_downlink = false;
+                downlink_playing_.store(false, std::memory_order_release);
                 last_tx_sample = 0;
                 idle_ticks = 0;
                 prebuf_ticks = 0;
@@ -877,6 +907,7 @@ void AudioEngine::RunOutputLoop() {
                          static_cast<unsigned long>(playback_frames),
                          static_cast<unsigned long>(playback_grace_waits));
                 playing_downlink = false;
+                downlink_playing_.store(false, std::memory_order_release);
                 last_tx_sample = 0;
                 prebuf_ticks = 0;
                 empty_grace_ticks = 0;
@@ -945,6 +976,7 @@ void AudioEngine::RunOutputLoop() {
                         static_cast<int16_t>(static_cast<float>(dma_tx_pcm_[i]) * gain);
                 }
                 playing_downlink = true;
+                downlink_playing_.store(true, std::memory_order_release);
                 idle_ticks = 0;
                 prebuf_ticks = 0;
                 empty_grace_ticks = 0;
