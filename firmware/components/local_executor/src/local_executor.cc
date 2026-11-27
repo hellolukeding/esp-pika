@@ -64,7 +64,7 @@ CommandResultPayload LocalExecutor::ExecuteCameraCapture(const GatewayCommand& c
         return MakeError(cmd.command_id, "UPLOADER_UNAVAILABLE", "media uploader unavailable");
     }
 
-    std::string resolution = "qvga";
+    std::string resolution = "vga";
     ExtractJsonStringField(cmd.params_json, "resolution", &resolution);
 
     JpegFrame frame;
@@ -77,9 +77,16 @@ CommandResultPayload LocalExecutor::ExecuteCameraCapture(const GatewayCommand& c
         return MakeError(cmd.command_id, "MEDIA_UPLOAD_FAILED", "HTTP media upload failed");
     }
 
-    char buf[160] = {};
-    std::snprintf(buf, sizeof(buf), "{\"width\":%u,\"height\":%u,\"bytes\":%zu}",
-                  frame.width, frame.height, frame.data.size());
+    char buf[256] = {};
+    if (!frame.sensor.empty()) {
+        std::snprintf(buf, sizeof(buf),
+                      "{\"width\":%u,\"height\":%u,\"bytes\":%zu,\"sensor\":\"%s\"}",
+                      frame.width, frame.height, frame.data.size(),
+                      EscapeJsonString(frame.sensor).c_str());
+    } else {
+        std::snprintf(buf, sizeof(buf), "{\"width\":%u,\"height\":%u,\"bytes\":%zu}",
+                      frame.width, frame.height, frame.data.size());
+    }
 
     CommandResultPayload res;
     res.command_id = cmd.command_id;

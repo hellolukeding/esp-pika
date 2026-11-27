@@ -553,6 +553,27 @@ std::string EzComputeAuthSignature(const uint8_t seed[32],
     return std::string(b64);
 }
 
+std::string EzComputeMediaUploadSignature(const uint8_t seed[32],
+                                          const uint8_t pub[32],
+                                          const std::string& device_id,
+                                          const std::string& connection_id,
+                                          const std::string& nonce,
+                                          const uint8_t body_sha256[32]) {
+    std::vector<uint8_t> media_t;
+    media_t.reserve(160 + device_id.size() + connection_id.size() + nonce.size());
+    EzAppendLengthPrefixed(&media_t, "ez-assistant-media-v1");
+    EzAppendLengthPrefixed(&media_t, device_id);
+    EzAppendLengthPrefixed(&media_t, connection_id);
+    EzAppendLengthPrefixed(&media_t, nonce);
+    EzAppendLengthPrefixed(&media_t, body_sha256, 32);
+
+    uint8_t sig[64] = {};
+    ez_ed25519_sign(seed, pub, media_t.data(), media_t.size(), sig);
+    char b64[128] = {};
+    ez_base64url_encode(sig, 64, b64, sizeof(b64));
+    return std::string(b64);
+}
+
 std::string EzBuildPairingHelloJson(const std::string& msg_id,
                                     const std::string& pairing_request_id,
                                     const std::string& display_name,

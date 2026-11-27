@@ -80,6 +80,14 @@ std::string EzComputeAuthSignature(const uint8_t seed[32],
                                    const EzCapabilities& caps,
                                    EzOutputPreference output_preference);
 
+/// Computes base64url(Ed25519 signature) for authenticated `POST /device/media`.
+std::string EzComputeMediaUploadSignature(const uint8_t seed[32],
+                                          const uint8_t pub[32],
+                                          const std::string& device_id,
+                                          const std::string& connection_id,
+                                          const std::string& nonce,
+                                          const uint8_t body_sha256[32]);
+
 // Outbound Device Protocol 1.0 JSON envelope builders
 std::string EzBuildPairingHelloJson(const std::string& msg_id,
                                     const std::string& pairing_request_id,

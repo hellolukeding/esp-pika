@@ -165,7 +165,10 @@ public:
         audio_.SetTransportCodec(audio_cfg.transport_codec);
         audio_.SetWakeMode(ToAudioWakeMode(wake_cfg_.mode), wake_cfg_.min_speech_ms,
                            wake_cfg_.cooldown_ms);
-        executor_ = std::make_unique<esp_pika::LocalExecutor>(board_.get(), &net_, &vp_store_);
+        esp_pika::MediaUploader* media_uploader =
+            ez_direct_mode_ ? static_cast<esp_pika::MediaUploader*>(&ez_client_)
+                            : static_cast<esp_pika::MediaUploader*>(&net_);
+        executor_ = std::make_unique<esp_pika::LocalExecutor>(board_.get(), media_uploader, &vp_store_);
         hw_ready_ = true;
 
         if (ez_direct_mode_) {
@@ -193,6 +196,10 @@ public:
                 "device.voiceprint_delete",
                 "device.voiceprint_capture",
             };
+            if (board_->Camera() != nullptr) {
+                ez_cfg.hardware.capabilities.push_back("device.camera_capture");
+                ESP_LOGI(kTag, "modular camera detected; advertising device.camera_capture");
+            }
 
             esp_pika::EzDeviceCallbacks ez_cbs;
             ez_cbs.on_state = [this](esp_pika::EzClientState s) { HandleEzState(s); };

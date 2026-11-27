@@ -31,6 +31,7 @@ struct JpegFrame {
     std::vector<uint8_t> data;
     uint16_t width = 0;
     uint16_t height = 0;
+    std::string sensor;
 };
 
 /// Hardware abstraction for full-duplex audio codec & volume control.

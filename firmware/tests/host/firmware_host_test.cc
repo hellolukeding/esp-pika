@@ -1233,6 +1233,29 @@ void TestPhase3WakeConfigMultiTemplateAndSpeculativeBuffer() {
     engine.Stop();
 }
 
+void TestMediaUploadSignatureAndCameraMetadata() {
+    uint8_t seed[32] = {};
+    for (size_t i = 0; i < 32; ++i) {
+        seed[i] = static_cast<uint8_t>(i + 1);
+    }
+    uint8_t pub[32] = {};
+    ez_ed25519_public_key(seed, pub);
+
+    const uint8_t jpeg_stub[] = {0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0xFF, 0xD9};
+    uint8_t sha[32] = {};
+    ez_sha256(jpeg_stub, sizeof(jpeg_stub), sha);
+
+    const std::string sig1 = EzComputeMediaUploadSignature(
+        seed, pub, "dev-mosaico-1", "conn-abc", "nonce-12345678", sha);
+    const std::string sig2 = EzComputeMediaUploadSignature(
+        seed, pub, "dev-mosaico-1", "conn-abc", "nonce-12345678", sha);
+    const std::string sig_diff_nonce = EzComputeMediaUploadSignature(
+        seed, pub, "dev-mosaico-1", "conn-abc", "nonce-87654321", sha);
+    assert(sig1.size() == 86); // 64 bytes base64url no-pad
+    assert(sig1 == sig2);
+    assert(sig1 != sig_diff_nonce);
+}
+
 } // namespace
 
 int main() {
@@ -1251,6 +1274,7 @@ int main() {
     TestEd25519Rfc8032VectorsAndEzCryptoFixture();
     TestEzProtocolAndUiPairingFlow();
     TestPhase3WakeConfigMultiTemplateAndSpeculativeBuffer();
+    TestMediaUploadSignatureAndCameraMetadata();
     std::printf("ALL FIRMWARE HOST TESTS PASSED\n");
     return 0;
 }

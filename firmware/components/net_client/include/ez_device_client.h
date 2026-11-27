@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "ez_protocol.h"
+#include "net_client.h"
 
 #ifdef ESP_PLATFORM
 #include "esp_event.h"
@@ -58,10 +59,10 @@ struct EzDeviceCallbacks {
 /// - Unpaired advertisement via `_ez-device._tcp` mDNS + local HTTP `:8765` (`/ez/info`, `/ez/connect`)
 /// - TLS cert-pinned WSS `/device` (direct_confirm Ed25519 pairing + authenticated streaming)
 /// - Passive `_ez-assistant._tcp` mDNS fallback & dynamic ephemeral port re-resolution
-class EzDeviceClient {
+class EzDeviceClient final : public MediaUploader {
 public:
     EzDeviceClient() = default;
-    ~EzDeviceClient();
+    ~EzDeviceClient() override;
 
     EzDeviceClient(const EzDeviceClient&) = delete;
     EzDeviceClient& operator=(const EzDeviceClient&) = delete;
@@ -106,6 +107,10 @@ public:
                            const std::string& error = "");
     void SetVoiceprintVersion(uint64_t vp_version);
     void SetWakeConfig(const EzWakeConfig& wake_config, bool multinet_ready);
+
+    /// Uploads a captured JPEG frame via dedicated cert-pinned HTTPS POST `/device/media`
+    /// authenticated with the device's Ed25519 identity and active WSS connection ID.
+    bool UploadJpeg(const uint8_t* data, size_t len, std::string* out_media_url) override;
 
     EzClientState State() const {
         return static_cast<EzClientState>(state_.load(std::memory_order_acquire));
@@ -170,6 +175,11 @@ private:
     EzConnectTrigger pairing_target_;
     std::string pairing_req_id_;
     std::string device_nonce_;
+    std::string active_connection_id_;
+#ifdef ESP_PLATFORM
+    std::string active_host_;
+    uint16_t active_port_ = 0;
+#endif
 
     std::atomic<bool> wifi_connected_{false};
     std::atomic<int> state_{static_cast<int>(EzClientState::kOffline)};

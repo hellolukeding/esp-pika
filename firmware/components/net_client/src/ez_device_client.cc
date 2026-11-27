@@ -13,6 +13,7 @@
 #include <arpa/inet.h>
 
 #include "esp_heap_caps.h"
+#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -496,6 +497,135 @@ void EzDeviceClient::SetWakeConfig(const EzWakeConfig& wake_config, bool multine
     cfg_.hardware.multinet_ready = multinet_ready;
 }
 
+bool EzDeviceClient::UploadJpeg(const uint8_t* data, size_t len, std::string* out_media_url) {
+    if (data == nullptr || len < 4 || out_media_url == nullptr || !IsOnline()) {
+        return false;
+    }
+#ifdef ESP_PLATFORM
+    std::string host;
+    uint16_t port = 0;
+    std::string cert_fp;
+    std::string device_id;
+    std::string connection_id;
+    std::string mac;
+    uint8_t seed[32] = {};
+    uint8_t pub[32] = {};
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        host = !active_host_.empty() ? active_host_ : identity_.host_address;
+        port = (active_port_ > 0) ? active_port_ : identity_.host_port;
+        cert_fp = identity_.cert_fingerprint;
+        device_id = identity_.device_id;
+        connection_id = active_connection_id_;
+        mac = cfg_.mac;
+        std::memcpy(seed, identity_.ed25519_seed, sizeof(seed));
+        std::memcpy(pub, identity_.ed25519_pub, sizeof(pub));
+    }
+    if (host.empty() || port == 0 || device_id.empty() || connection_id.empty() ||
+        !SetPinnedCertHex(cert_fp)) {
+        ESP_LOGW(kClientTag, "UploadJpeg missing active endpoint or connection_id");
+        return false;
+    }
+
+    uint8_t body_sha256[32] = {};
+    ez_sha256(data, len, body_sha256);
+    const std::string nonce = RandomTokenB64Url(16);
+    const std::string signature = EzComputeMediaUploadSignature(
+        seed, pub, device_id, connection_id, nonce, body_sha256);
+    if (signature.empty()) {
+        return false;
+    }
+
+    char url_buf[256] = {};
+    std::snprintf(url_buf, sizeof(url_buf), "https://%s:%u/device/media", host.c_str(), port);
+
+    esp_http_client_config_t http_cfg = {};
+    http_cfg.url = url_buf;
+    http_cfg.method = HTTP_METHOD_POST;
+    http_cfg.timeout_ms = 10000;
+    http_cfg.crt_bundle_attach = &EzPinnedCertAttach;
+    http_cfg.skip_cert_common_name_check = true;
+    http_cfg.buffer_size = 2048;
+    http_cfg.buffer_size_tx = 2048;
+
+    esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
+    if (client == nullptr) {
+        ESP_LOGE(kClientTag, "esp_http_client_init(%s) failed", url_buf);
+        return false;
+    }
+    esp_http_client_set_header(client, "Content-Type", "image/jpeg");
+    esp_http_client_set_header(client, "X-Device-ID", device_id.c_str());
+    esp_http_client_set_header(client, "X-Device-Connection-ID", connection_id.c_str());
+    if (!mac.empty()) {
+        esp_http_client_set_header(client, "X-Device-MAC", mac.c_str());
+    }
+    esp_http_client_set_header(client, "X-Device-Nonce", nonce.c_str());
+    esp_http_client_set_header(client, "X-Device-Signature", signature.c_str());
+
+    esp_err_t err = esp_http_client_open(client, static_cast<int>(len));
+    if (err != ESP_OK) {
+        ESP_LOGW(kClientTag, "HTTPS media upload open(%s) failed: %s",
+                 url_buf, esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return false;
+    }
+
+    size_t sent_total = 0;
+    while (sent_total < len) {
+        const int chunk = static_cast<int>(std::min<size_t>(4096, len - sent_total));
+        const int w = esp_http_client_write(
+            client, reinterpret_cast<const char*>(data + sent_total), chunk);
+        if (w <= 0) {
+            ESP_LOGW(kClientTag, "HTTPS media upload write failed at %u/%u",
+                     static_cast<unsigned>(sent_total), static_cast<unsigned>(len));
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+            return false;
+        }
+        sent_total += static_cast<size_t>(w);
+    }
+
+    const int content_len = esp_http_client_fetch_headers(client);
+    const int status = esp_http_client_get_status_code(client);
+    std::string resp_body;
+    if (content_len > 0 && content_len < 4096) {
+        resp_body.resize(static_cast<size_t>(content_len));
+        const int r = esp_http_client_read_response(client, resp_body.data(), content_len);
+        if (r >= 0) {
+            resp_body.resize(static_cast<size_t>(r));
+        }
+    } else if (content_len < 0) {
+        char buf[512] = {};
+        while (resp_body.size() < 4096) {
+            const int r = esp_http_client_read(client, buf, sizeof(buf));
+            if (r <= 0) {
+                break;
+            }
+            resp_body.append(buf, static_cast<size_t>(r));
+        }
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (status < 200 || status >= 300) {
+        ESP_LOGW(kClientTag, "HTTPS media upload rejected HTTP %d: %s", status, resp_body.c_str());
+        return false;
+    }
+    if (!ParseMediaUploadResponse(resp_body, out_media_url)) {
+        ESP_LOGW(kClientTag, "HTTPS media upload response missing media_url: %s", resp_body.c_str());
+        return false;
+    }
+    ESP_LOGI(kClientTag, "HTTPS media upload OK (%u bytes) -> %s",
+             static_cast<unsigned>(len), out_media_url->c_str());
+    return true;
+#else
+    (void)data;
+    (void)len;
+    (void)out_media_url;
+    return false;
+#endif
+}
+
 void EzDeviceClient::HandleInboundEnvelope(const std::string& json_text) {
     EzInboundMessage msg;
     if (!EzParseInboundMessage(json_text, &msg)) {
@@ -523,6 +653,7 @@ void EzDeviceClient::HandleInboundEnvelope(const std::string& json_text) {
             caps = caps_;
             hw_snapshot = cfg_.hardware;
             device_nonce_ = dev_nonce;
+            active_connection_id_ = msg.connection_id;
             std::memcpy(seed, identity_.ed25519_seed, sizeof(seed));
             std::memcpy(pub, identity_.ed25519_pub, sizeof(pub));
             pub_b64 = identity_.PublicKeyBase64Url();
@@ -595,6 +726,10 @@ void EzDeviceClient::HandleInboundEnvelope(const std::string& json_text) {
         break;
     }
     case EzInboundType::kHelloAck: {
+        if (!msg.connection_id.empty()) {
+            std::lock_guard<std::mutex> lock(mu_);
+            active_connection_id_ = msg.connection_id;
+        }
         asr_ready_.store(msg.capabilities.input_pcm16_16k_mono, std::memory_order_release);
         const bool tts_ok = msg.capabilities.output_pcm16_16k_mono;
         tts_ready_.store(tts_ok, std::memory_order_release);
@@ -932,6 +1067,9 @@ bool EzDeviceClient::StartWebSocketLocked(const std::string& host,
     {
         std::lock_guard<std::mutex> lock(mu_);
         ws_pairing_mode_ = pairing_mode;
+        active_host_ = host;
+        active_port_ = port;
+        active_connection_id_.clear();
         pairing_req_id_.clear();
         device_nonce_.clear();
         pending_tx_json_.clear();

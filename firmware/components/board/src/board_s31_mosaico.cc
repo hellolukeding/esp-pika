@@ -13,21 +13,38 @@
 #include <vector>
 
 #ifdef ESP_PLATFORM
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/time.h>
+#include <unistd.h>
+
 #include "bmi270.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/i2s_std.h"
+#include "driver/ppa.h"
 #include "driver/spi_master.h"
+#include "esp_cache.h"
+#include "esp_cam_ctlr.h"
+#include "esp_cam_sensor_types.h"
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
 #include "esp_heap_caps.h"
+#include "esp_jpeg_enc.h"
 #include "esp_lcd_co5300.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
+#include "esp_video_device.h"
+#include "esp_video_init.h"
+#include "esp_video_ioctl.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "hal/usb_serial_jtag_ll.h"
+#include "linux/videodev2.h"
 #include "sdkconfig.h"
 #ifdef CONFIG_TINYUSB_CDC_ENABLED
 #include "tinyusb.h"
@@ -75,6 +92,39 @@ constexpr int kDisplayStripRows = 24;
 constexpr uint8_t kMosaicoEs8311Addr7Bit = 0x19;
 constexpr uint8_t kMosaicoBq27220Addr7Bit = 0x55;
 constexpr uint8_t kMosaicoCst9220Addr7Bit = 0x5A;
+
+// Left expansion slot (H2) external I2C1 & 8-bit DVP camera module pins (CoreBoard V1.2).
+// Both camera module revisions (V1.2 OV3640 / V1.4 SC101IOT) share this pinout and provide
+// their own onboard XCLK oscillator (no host XCLK GPIO required).
+constexpr gpio_num_t kMosaicoSubboardI2cSda = GPIO_NUM_0;
+constexpr gpio_num_t kMosaicoSubboardI2cScl = GPIO_NUM_1;
+constexpr gpio_num_t kMosaicoLeftAddrSelPin = GPIO_NUM_14;
+constexpr gpio_num_t kMosaicoRightAddrSelPin = GPIO_NUM_39;
+constexpr gpio_num_t kMosaicoCamD0Pin = GPIO_NUM_16;
+constexpr gpio_num_t kMosaicoCamD1Pin = GPIO_NUM_15;
+constexpr gpio_num_t kMosaicoCamD2Pin = GPIO_NUM_33; // Multiplexed with USB Serial/JTAG D-
+constexpr gpio_num_t kMosaicoCamD3Pin = GPIO_NUM_4;
+constexpr gpio_num_t kMosaicoCamD4Pin = GPIO_NUM_14; // Reuses left EEPROM address-select pin
+constexpr gpio_num_t kMosaicoCamD5Pin = GPIO_NUM_12;
+constexpr gpio_num_t kMosaicoCamD6Pin = GPIO_NUM_18;
+constexpr gpio_num_t kMosaicoCamD7Pin = GPIO_NUM_13;
+constexpr gpio_num_t kMosaicoCamVsyncPin = GPIO_NUM_55;
+constexpr gpio_num_t kMosaicoCamDePin = GPIO_NUM_19;
+constexpr gpio_num_t kMosaicoCamPclkPin = GPIO_NUM_17;
+constexpr gpio_num_t kMosaicoCamResetPin = GPIO_NUM_53;
+constexpr gpio_num_t kMosaicoCamPwdnPin = GPIO_NUM_48;  // 0 = normal/wake, 1 = sleep
+constexpr gpio_num_t kMosaicoCamFlashPin = GPIO_NUM_34; // Open-drain: 0 = on, 1 = off (USJ D+)
+
+constexpr uint8_t kMosaicoLeftEepromAddr7Bit = 0x50;
+constexpr uint8_t kMosaicoOv3640Addr7Bit = 0x3C;
+constexpr uint8_t kMosaicoSc101iotAddr7Bit = 0x68;
+constexpr uint8_t kMosaicoSc101iotAltAddr7Bit = 0x30;
+constexpr uint16_t kOv3640Pid1 = 0x364C;
+constexpr uint16_t kOv3640Pid2 = 0x3641;
+constexpr uint16_t kSc101iotPid = 0xDA4A;
+constexpr uint32_t kCameraSccbFreqHz = 100000;
+constexpr size_t kCameraMaxJpegBytes = 256 * 1024;
+constexpr size_t kCameraPpaAlign = 128;
 
 // BQ27220 standard I2C command addresses (little-endian 16-bit values).
 constexpr uint8_t kBqRegTemperature = 0x06; // 0.1 K
@@ -1115,6 +1165,692 @@ void InitMosaicoUsbConsole() {
 #endif
 }
 
+class MosaicoCamera final : public CameraHal {
+public:
+    ~MosaicoCamera() override { Deinit(); }
+
+    void Deinit() {
+#ifdef ESP_PLATFORM
+        std::lock_guard<std::mutex> lock(mu_);
+        if (ppa_client_ != nullptr) {
+            ppa_unregister_client(ppa_client_);
+            ppa_client_ = nullptr;
+        }
+        if (video_initialized_) {
+            SetPwdnLocked(false);
+            esp_video_deinit();
+            SetPwdnLocked(true);
+            video_initialized_ = false;
+        }
+        if (usj_claimed_) {
+            RestoreUsjLocked();
+            usj_claimed_ = false;
+        }
+        if (subboard_i2c_ != nullptr) {
+            i2c_del_master_bus(subboard_i2c_);
+            subboard_i2c_ = nullptr;
+        }
+        present_ = false;
+#endif
+    }
+
+    bool IsPresent() const {
+#ifdef ESP_PLATFORM
+        return present_;
+#else
+        return false;
+#endif
+    }
+
+    bool Init() override {
+#ifdef ESP_PLATFORM
+        std::lock_guard<std::mutex> lock(mu_);
+        if (present_) {
+            return true;
+        }
+
+        // External expansion I2C1 bus (CoreBoard V1.2: SDA=GPIO0, SCL=GPIO1).
+        i2c_master_bus_config_t i2c_cfg = {};
+        i2c_cfg.i2c_port = I2C_NUM_1;
+        i2c_cfg.sda_io_num = kMosaicoSubboardI2cSda;
+        i2c_cfg.scl_io_num = kMosaicoSubboardI2cScl;
+        i2c_cfg.clk_source = I2C_CLK_SRC_DEFAULT;
+        i2c_cfg.glitch_ignore_cnt = 7;
+        i2c_cfg.flags.enable_internal_pullup = true;
+        if (i2c_new_master_bus(&i2c_cfg, &subboard_i2c_) != ESP_OK) {
+            ESP_LOGW(kTag, "subboard I2C1 init failed (SDA=GPIO%d SCL=GPIO%d)",
+                     kMosaicoSubboardI2cSda, kMosaicoSubboardI2cScl);
+            subboard_i2c_ = nullptr;
+            return false;
+        }
+
+        // Configure slot address-select lines so right-slot modules map to 0x51 and
+        // left-slot modules map to 0x50 before probing.
+        ConfigureOutputPin(kMosaicoRightAddrSelPin, 1);
+        ConfigureOutputPin(kMosaicoLeftAddrSelPin, 0);
+
+        // Configure board-level PWDN (0 = wake, 1 = sleep) and pulse sensor RESET.
+        ConfigureOutputPin(kMosaicoCamPwdnPin, 0);
+        gpio_sleep_sel_dis(kMosaicoCamPwdnPin);
+        pwdn_configured_ = true;
+        ConfigureOutputPin(kMosaicoCamResetPin, 0);
+        vTaskDelay(pdMS_TO_TICKS(5));
+        gpio_set_level(kMosaicoCamResetPin, 1);
+        // Wait for onboard 20/24 MHz XCLK oscillator stabilization before SCCB probe.
+        vTaskDelay(pdMS_TO_TICKS(30));
+
+        const bool ack_eeprom = (i2c_master_probe(subboard_i2c_, kMosaicoLeftEepromAddr7Bit, 40) == ESP_OK);
+        const bool ack_ov3640 = (i2c_master_probe(subboard_i2c_, kMosaicoOv3640Addr7Bit, 40) == ESP_OK);
+        const bool ack_sc101 = (i2c_master_probe(subboard_i2c_, kMosaicoSc101iotAddr7Bit, 40) == ESP_OK);
+        const bool ack_sc101_alt = (i2c_master_probe(subboard_i2c_, kMosaicoSc101iotAltAddr7Bit, 40) == ESP_OK);
+        ESP_LOGI(kTag,
+                 "I2C1 left-slot probe: EEPROM(0x50)=%s OV3640(0x3C)=%s SC101IOT(0x68/0x30)=%s/%s",
+                 ack_eeprom ? "ACK" : "-", ack_ov3640 ? "ACK" : "-",
+                 ack_sc101 ? "ACK" : "-", ack_sc101_alt ? "ACK" : "-");
+
+        if (!ack_eeprom && !ack_ov3640 && !ack_sc101 && !ack_sc101_alt) {
+            ESP_LOGI(kTag, "No camera module detected on left slot H2");
+            SetPwdnLocked(true);
+            return false;
+        }
+
+        // Camera DVP_D2 (GPIO33) and FLASH (GPIO34) multiplex with USB Serial/JTAG PHY pads.
+        // Force flash LED off (open-drain high) and release USB Serial/JTAG pads now that
+        // a camera module is detected; Type-C TinyUSB CDC console uses the separate UTMI PHY.
+        ForceFlashOff();
+        ClaimUsjLocked();
+        usj_claimed_ = true;
+
+        // Release GPIO14 from EEPROM address-select output so DVP D4 can claim it cleanly.
+        gpio_reset_pin(kMosaicoCamD4Pin);
+
+        esp_video_init_dvp_config_t dvp_cfg = {};
+        dvp_cfg.sccb_config.init_sccb = false;
+        dvp_cfg.sccb_config.i2c_handle = subboard_i2c_;
+        dvp_cfg.sccb_config.freq = kCameraSccbFreqHz;
+        dvp_cfg.reset_pin = kMosaicoCamResetPin;
+        dvp_cfg.pwdn_pin = GPIO_NUM_NC; // Board manages GPIO48 directly (0=wake, 1=sleep).
+        dvp_cfg.dvp_pin.data_width = CAM_CTLR_DATA_WIDTH_8;
+        dvp_cfg.dvp_pin.data_io[0] = kMosaicoCamD0Pin;
+        dvp_cfg.dvp_pin.data_io[1] = kMosaicoCamD1Pin;
+        dvp_cfg.dvp_pin.data_io[2] = kMosaicoCamD2Pin;
+        dvp_cfg.dvp_pin.data_io[3] = kMosaicoCamD3Pin;
+        dvp_cfg.dvp_pin.data_io[4] = kMosaicoCamD4Pin;
+        dvp_cfg.dvp_pin.data_io[5] = kMosaicoCamD5Pin;
+        dvp_cfg.dvp_pin.data_io[6] = kMosaicoCamD6Pin;
+        dvp_cfg.dvp_pin.data_io[7] = kMosaicoCamD7Pin;
+        dvp_cfg.dvp_pin.vsync_io = kMosaicoCamVsyncPin;
+        dvp_cfg.dvp_pin.de_io = kMosaicoCamDePin;
+        dvp_cfg.dvp_pin.pclk_io = kMosaicoCamPclkPin;
+        dvp_cfg.dvp_pin.xclk_io = GPIO_NUM_NC;
+        dvp_cfg.xclk_freq = 0;
+
+        esp_video_init_config_t video_cfg = {};
+        video_cfg.dvp = &dvp_cfg;
+
+        esp_err_t err = esp_video_init(&video_cfg);
+        if (err != ESP_OK) {
+            ESP_LOGW(kTag, "esp_video_init(DVP) failed: %s (left slot may hold non-camera module)",
+                     esp_err_to_name(err));
+            SetPwdnLocked(true);
+            RestoreUsjLocked();
+            usj_claimed_ = false;
+            return false;
+        }
+        video_initialized_ = true;
+        ForceFlashOff();
+
+        // Open DVP video device once to verify sensor chip ID & native resolution, then sleep.
+        const int fd = open(ESP_VIDEO_DVP_DEVICE_NAME, O_RDWR);
+        if (fd < 0) {
+            ESP_LOGW(kTag, "open(%s) failed errno=%d", ESP_VIDEO_DVP_DEVICE_NAME, errno);
+            esp_video_deinit();
+            video_initialized_ = false;
+            SetPwdnLocked(true);
+            RestoreUsjLocked();
+            usj_claimed_ = false;
+            return false;
+        }
+
+        esp_cam_sensor_id_t sensor_id = {};
+        if (QuerySensorId(fd, &sensor_id)) {
+            sensor_pid_ = sensor_id.pid;
+            if (sensor_pid_ == kOv3640Pid1 || sensor_pid_ == kOv3640Pid2) {
+                sensor_name_ = "OV3640";
+            } else if (sensor_pid_ == kSc101iotPid) {
+                sensor_name_ = "SC101IOT";
+            } else {
+                sensor_name_ = "DVP";
+            }
+        } else {
+            sensor_name_ = "DVP";
+        }
+
+        struct v4l2_format fmt = {};
+        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (ioctl(fd, VIDIOC_G_FMT, &fmt) == 0) {
+            native_width_ = fmt.fmt.pix.width;
+            native_height_ = fmt.fmt.pix.height;
+        }
+        close(fd);
+        SetPwdnLocked(true);
+
+        ppa_client_config_t ppa_cfg = {};
+        ppa_cfg.oper_type = PPA_OPERATION_SRM;
+        ppa_cfg.max_pending_trans_num = 1;
+        err = ppa_register_client(&ppa_cfg, &ppa_client_);
+        if (err != ESP_OK) {
+            ESP_LOGE(kTag, "ppa_register_client(SRM) failed: %s", esp_err_to_name(err));
+            esp_video_deinit();
+            video_initialized_ = false;
+            RestoreUsjLocked();
+            usj_claimed_ = false;
+            return false;
+        }
+
+        present_ = true;
+        ESP_LOGI(kTag, "Mosaico camera ready: sensor=%s pid=0x%04X native=%lux%lu",
+                 sensor_name_.c_str(), static_cast<unsigned>(sensor_pid_),
+                 static_cast<unsigned long>(native_width_),
+                 static_cast<unsigned long>(native_height_));
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    bool CaptureJpeg(const std::string& resolution, JpegFrame* out) override {
+        if (out == nullptr) {
+            return false;
+        }
+#ifdef ESP_PLATFORM
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!present_ || !video_initialized_ || ppa_client_ == nullptr) {
+            return false;
+        }
+
+        const int64_t t0 = NowMillis();
+        gpio_set_level(kMosaicoCamFlashPin, 1);
+        SetPwdnLocked(false);
+
+        const int fd = open(ESP_VIDEO_DVP_DEVICE_NAME, O_RDWR);
+        if (fd < 0) {
+            ESP_LOGE(kTag, "camera capture open(%s) failed errno=%d",
+                     ESP_VIDEO_DVP_DEVICE_NAME, errno);
+            SetPwdnLocked(true);
+            return false;
+        }
+
+        constexpr uint32_t kBufCount = 3;
+        void* mmap_bufs[kBufCount] = {};
+        size_t mmap_lens[kBufCount] = {};
+        uint32_t mapped_count = 0;
+        bool streaming = false;
+        uint8_t* rgb565_buf = nullptr;
+        uint8_t* jpeg_buf = nullptr;
+
+        auto cleanup_v4l2 = [&]() {
+            if (streaming) {
+                int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                ioctl(fd, VIDIOC_STREAMOFF, &type);
+                streaming = false;
+            }
+            for (uint32_t i = 0; i < mapped_count; ++i) {
+                if (mmap_bufs[i] != nullptr && mmap_bufs[i] != MAP_FAILED) {
+                    munmap(mmap_bufs[i], mmap_lens[i]);
+                    mmap_bufs[i] = nullptr;
+                    mmap_lens[i] = 0;
+                }
+            }
+            if (mapped_count > 0) {
+                struct v4l2_requestbuffers req = {};
+                req.count = 0;
+                req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                req.memory = V4L2_MEMORY_MMAP;
+                ioctl(fd, VIDIOC_REQBUFS, &req);
+                mapped_count = 0;
+            }
+            close(fd);
+            gpio_set_level(kMosaicoCamFlashPin, 1);
+            SetPwdnLocked(true);
+        };
+
+        auto cleanup_all = [&]() {
+            cleanup_v4l2();
+            if (rgb565_buf != nullptr) {
+                heap_caps_free(rgb565_buf);
+                rgb565_buf = nullptr;
+            }
+            if (jpeg_buf != nullptr) {
+                heap_caps_free(jpeg_buf);
+                jpeg_buf = nullptr;
+            }
+        };
+
+        struct v4l2_format fmt = {};
+        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (ioctl(fd, VIDIOC_G_FMT, &fmt) != 0) {
+            ESP_LOGE(kTag, "VIDIOC_G_FMT failed errno=%d", errno);
+            cleanup_all();
+            return false;
+        }
+        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_UYVY;
+        if (ioctl(fd, VIDIOC_S_FMT, &fmt) != 0) {
+            ESP_LOGE(kTag, "VIDIOC_S_FMT(UYVY) failed errno=%d", errno);
+            cleanup_all();
+            return false;
+        }
+        const uint32_t frame_w = fmt.fmt.pix.width;
+        const uint32_t frame_h = fmt.fmt.pix.height;
+        const uint32_t bytes_per_line =
+            (fmt.fmt.pix.bytesperline > 0) ? fmt.fmt.pix.bytesperline : (frame_w * 2U);
+        const uint32_t expected_size =
+            (fmt.fmt.pix.sizeimage > 0) ? fmt.fmt.pix.sizeimage : (bytes_per_line * frame_h);
+        if (frame_w < 320 || frame_h < 240 || (bytes_per_line % 2U) != 0) {
+            ESP_LOGE(kTag, "invalid sensor geometry %lux%lu stride=%lu",
+                     static_cast<unsigned long>(frame_w), static_cast<unsigned long>(frame_h),
+                     static_cast<unsigned long>(bytes_per_line));
+            cleanup_all();
+            return false;
+        }
+
+#ifdef VIDIOC_S_DQBUF_TIMEOUT
+        {
+            struct timeval timeout = {};
+            timeout.tv_sec = 2;
+            timeout.tv_usec = 0;
+            ioctl(fd, VIDIOC_S_DQBUF_TIMEOUT, &timeout);
+        }
+#endif
+
+        struct v4l2_requestbuffers req = {};
+        req.count = kBufCount;
+        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        req.memory = V4L2_MEMORY_MMAP;
+        if (ioctl(fd, VIDIOC_REQBUFS, &req) != 0 || req.count == 0 || req.count > kBufCount) {
+            ESP_LOGE(kTag, "VIDIOC_REQBUFS failed errno=%d count=%lu free_psram=%u",
+                     errno, static_cast<unsigned long>(req.count),
+                     static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+            cleanup_all();
+            return false;
+        }
+        mapped_count = req.count;
+
+        for (uint32_t i = 0; i < mapped_count; ++i) {
+            struct v4l2_buffer qbuf = {};
+            qbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            qbuf.memory = V4L2_MEMORY_MMAP;
+            qbuf.index = i;
+            if (ioctl(fd, VIDIOC_QUERYBUF, &qbuf) != 0) {
+                ESP_LOGE(kTag, "VIDIOC_QUERYBUF(%lu) failed errno=%d",
+                         static_cast<unsigned long>(i), errno);
+                cleanup_all();
+                return false;
+            }
+            mmap_bufs[i] = mmap(nullptr, qbuf.length, PROT_READ | PROT_WRITE, MAP_SHARED,
+                                fd, qbuf.m.offset);
+            if (mmap_bufs[i] == MAP_FAILED) {
+                ESP_LOGE(kTag, "mmap(%lu) failed errno=%d", static_cast<unsigned long>(i), errno);
+                mmap_bufs[i] = nullptr;
+                cleanup_all();
+                return false;
+            }
+            mmap_lens[i] = qbuf.length;
+            if (ioctl(fd, VIDIOC_QBUF, &qbuf) != 0) {
+                ESP_LOGE(kTag, "VIDIOC_QBUF(%lu) failed errno=%d",
+                         static_cast<unsigned long>(i), errno);
+                cleanup_all();
+                return false;
+            }
+        }
+
+        int stream_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (ioctl(fd, VIDIOC_STREAMON, &stream_type) != 0) {
+            ESP_LOGE(kTag, "VIDIOC_STREAMON failed errno=%d", errno);
+            cleanup_all();
+            return false;
+        }
+        streaming = true;
+
+        // Apply official Espressif sensor tuning right after stream start.
+        ApplySensorTuning(fd);
+        gpio_set_level(kMosaicoCamFlashPin, 1);
+
+        // Discard initial frames so AEC/AWB converges to neutral white after cold PWDN wakeup
+        // (~25 frames @ 25 fps ~= 1.0 s) and DVP FIFO settles.
+        constexpr int kWarmupFrames = 25;
+        for (int i = 0; i < kWarmupFrames; ++i) {
+            struct v4l2_buffer d = {};
+            d.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            d.memory = V4L2_MEMORY_MMAP;
+            if (ioctl(fd, VIDIOC_DQBUF, &d) != 0) {
+                ESP_LOGW(kTag, "warmup DQBUF %d failed errno=%d", i, errno);
+                break;
+            }
+            ioctl(fd, VIDIOC_QBUF, &d);
+        }
+
+        // Capture one complete frame (retry on short/corrupt DVP frame).
+        struct v4l2_buffer cap = {};
+        bool got_frame = false;
+        for (int attempt = 0; attempt < 5; ++attempt) {
+            cap = {};
+            cap.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            cap.memory = V4L2_MEMORY_MMAP;
+            if (ioctl(fd, VIDIOC_DQBUF, &cap) != 0) {
+                ESP_LOGE(kTag, "capture DQBUF attempt %d failed errno=%d", attempt, errno);
+                continue;
+            }
+            if (cap.index >= mapped_count || mmap_bufs[cap.index] == nullptr) {
+                continue;
+            }
+            const bool bad_flags = (cap.flags & V4L2_BUF_FLAG_ERROR) != 0;
+            const bool short_frame = (cap.bytesused < expected_size);
+            if (bad_flags || short_frame) {
+                ESP_LOGW(kTag, "discarding partial DVP frame flags=0x%lx bytes=%lu/%lu",
+                         static_cast<unsigned long>(cap.flags),
+                         static_cast<unsigned long>(cap.bytesused),
+                         static_cast<unsigned long>(expected_size));
+                ioctl(fd, VIDIOC_QBUF, &cap);
+                continue;
+            }
+            got_frame = true;
+            break;
+        }
+        if (!got_frame) {
+            ESP_LOGE(kTag, "failed to acquire valid camera frame");
+            cleanup_all();
+            return false;
+        }
+
+        // Choose exact PPA 1/16-step scale & 16-pixel-aligned output dimensions for JPEG 4:2:0.
+        // Sensor FPC is mounted 90 deg rotated on left slot H2, so PPA rotates 270 deg + mirror_y.
+        uint32_t crop_w = 640;
+        uint32_t crop_h = 640;
+        uint32_t out_w = 480;
+        uint32_t out_h = 480;
+        float scale = 0.75f;
+        if (resolution == "qvga") {
+            crop_w = 640;
+            crop_h = 640;
+            out_w = 320;
+            out_h = 320;
+            scale = 0.5f;
+        } else if (resolution == "hd" && frame_w >= 960 && frame_h >= 704) {
+            crop_w = 960;
+            crop_h = 704;
+            out_w = 528;
+            out_h = 720;
+            scale = 0.75f;
+        }
+        if (frame_w < crop_w || frame_h < crop_h) {
+            crop_w = (frame_w & ~15U);
+            crop_h = (frame_h & ~15U);
+            out_w = crop_h;
+            out_h = crop_w;
+            scale = 1.0f;
+        }
+
+        const size_t rgb565_raw_bytes = static_cast<size_t>(out_w) * out_h * sizeof(uint16_t);
+        const size_t rgb565_buf_bytes = AlignUp(rgb565_raw_bytes, kCameraPpaAlign);
+        rgb565_buf = static_cast<uint8_t*>(heap_caps_aligned_calloc(
+            kCameraPpaAlign, 1, rgb565_buf_bytes,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
+        if (rgb565_buf == nullptr) {
+            ESP_LOGE(kTag, "failed to allocate %u-byte PPA RGB565 buffer in PSRAM",
+                     static_cast<unsigned>(rgb565_buf_bytes));
+            ioctl(fd, VIDIOC_QBUF, &cap);
+            cleanup_all();
+            return false;
+        }
+
+        const size_t in_sync_len = std::min<size_t>(
+            AlignUp(static_cast<size_t>(cap.bytesused), 64), mmap_lens[cap.index]);
+        esp_cache_msync(mmap_bufs[cap.index], in_sync_len,
+                        ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+        esp_cache_msync(rgb565_buf, rgb565_buf_bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+
+        ppa_srm_oper_config_t srm = {};
+        srm.in.buffer = mmap_bufs[cap.index];
+        srm.in.pic_w = bytes_per_line / 2U;
+        srm.in.pic_h = frame_h;
+        srm.in.block_w = crop_w;
+        srm.in.block_h = crop_h;
+        srm.in.block_offset_x = ((frame_w - crop_w) / 2U) & ~1U;
+        srm.in.block_offset_y = ((frame_h - crop_h) / 2U) & ~1U;
+        srm.in.srm_cm = PPA_SRM_COLOR_MODE_YUV422_UYVY;
+        srm.in.yuv_range = PPA_COLOR_RANGE_LIMIT;
+        srm.in.yuv_std = PPA_COLOR_CONV_STD_RGB_YUV_BT601;
+        srm.out.buffer = rgb565_buf;
+        srm.out.buffer_size = rgb565_buf_bytes;
+        srm.out.pic_w = out_w;
+        srm.out.pic_h = out_h;
+        srm.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+        srm.rotation_angle = PPA_SRM_ROTATION_ANGLE_270;
+        srm.scale_x = scale;
+        srm.scale_y = scale;
+        srm.mirror_x = false;
+        srm.mirror_y = true;
+        srm.mode = PPA_TRANS_MODE_BLOCKING;
+
+        const esp_err_t ppa_err = ppa_do_scale_rotate_mirror(ppa_client_, &srm);
+        ioctl(fd, VIDIOC_QBUF, &cap);
+        // Stop V4L2 stream & put sensor back to sleep immediately after PPA finishes.
+        cleanup_v4l2();
+
+        if (ppa_err != ESP_OK) {
+            ESP_LOGE(kTag, "ppa_do_scale_rotate_mirror failed: %s", esp_err_to_name(ppa_err));
+            heap_caps_free(rgb565_buf);
+            return false;
+        }
+        esp_cache_msync(rgb565_buf, rgb565_buf_bytes,
+                        ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+
+        jpeg_buf = static_cast<uint8_t*>(
+            heap_caps_malloc(kCameraMaxJpegBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (jpeg_buf == nullptr) {
+            ESP_LOGE(kTag, "failed to allocate PSRAM JPEG output buffer");
+            heap_caps_free(rgb565_buf);
+            return false;
+        }
+
+        jpeg_enc_config_t enc_cfg = DEFAULT_JPEG_ENC_CONFIG();
+        enc_cfg.width = static_cast<int>(out_w);
+        enc_cfg.height = static_cast<int>(out_h);
+        enc_cfg.src_type = JPEG_PIXEL_FORMAT_RGB565_LE;
+        enc_cfg.subsampling = JPEG_SUBSAMPLE_420;
+        enc_cfg.quality = 80;
+        enc_cfg.rotate = JPEG_ROTATE_0D;
+        enc_cfg.task_enable = false;
+
+        jpeg_enc_handle_t encoder = nullptr;
+        jpeg_error_t jret = jpeg_enc_open(&enc_cfg, &encoder);
+        int jpeg_size = 0;
+        if (jret == JPEG_ERR_OK && encoder != nullptr) {
+            jret = jpeg_enc_process(encoder, rgb565_buf, static_cast<int>(rgb565_raw_bytes),
+                                    jpeg_buf, static_cast<int>(kCameraMaxJpegBytes), &jpeg_size);
+            jpeg_enc_close(encoder);
+        }
+        heap_caps_free(rgb565_buf);
+        rgb565_buf = nullptr;
+
+        if (jret != JPEG_ERR_OK || jpeg_size < 4 || jpeg_buf[0] != 0xFF || jpeg_buf[1] != 0xD8) {
+            ESP_LOGE(kTag, "JPEG encode failed err=%d size=%d", static_cast<int>(jret), jpeg_size);
+            heap_caps_free(jpeg_buf);
+            return false;
+        }
+
+        out->width = static_cast<uint16_t>(out_w);
+        out->height = static_cast<uint16_t>(out_h);
+        out->sensor = sensor_name_;
+        out->data.assign(jpeg_buf, jpeg_buf + jpeg_size);
+        heap_caps_free(jpeg_buf);
+
+        ESP_LOGI(kTag, "captured %s JPEG %ux%u (%d bytes) in %lld ms",
+                 sensor_name_.c_str(), out->width, out->height, jpeg_size,
+                 static_cast<long long>(NowMillis() - t0));
+        return true;
+#else
+        (void)resolution;
+        return false;
+#endif
+    }
+
+private:
+#ifdef ESP_PLATFORM
+    static size_t AlignUp(size_t value, size_t alignment) {
+        return (value + alignment - 1U) & ~(alignment - 1U);
+    }
+
+    static void ConfigureOutputPin(gpio_num_t pin, int level) {
+        gpio_reset_pin(pin);
+        gpio_config_t cfg = {};
+        cfg.pin_bit_mask = (1ULL << static_cast<uint32_t>(pin));
+        cfg.mode = GPIO_MODE_OUTPUT;
+        cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+        cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        cfg.intr_type = GPIO_INTR_DISABLE;
+        gpio_set_level(pin, level);
+        gpio_config(&cfg);
+    }
+
+    static void ForceFlashOff() {
+        gpio_config_t cfg = {};
+        cfg.pin_bit_mask = (1ULL << static_cast<uint32_t>(kMosaicoCamFlashPin));
+        cfg.mode = GPIO_MODE_OUTPUT_OD;
+        cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+        cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        cfg.intr_type = GPIO_INTR_DISABLE;
+        gpio_set_level(kMosaicoCamFlashPin, 1);
+        gpio_config(&cfg);
+        gpio_sleep_sel_dis(kMosaicoCamFlashPin);
+    }
+
+    void ClaimUsjLocked() {
+        usj_pad_was_enabled_ = usb_serial_jtag_ll_phy_is_pad_enabled();
+        usj_clock_was_enabled_ = usb_serial_jtag_ll_module_is_enabled();
+        usj_intr_mask_ = usj_clock_was_enabled_ ? usb_serial_jtag_ll_get_intr_ena_status() : 0;
+        usb_serial_jtag_ll_disable_intr_mask(USB_SERIAL_JTAG_LL_INTR_MASK);
+        usb_serial_jtag_ll_phy_enable_pad(false);
+        usb_serial_jtag_ll_enable_bus_clock(false);
+    }
+
+    void RestoreUsjLocked() {
+        if (usj_clock_was_enabled_) {
+            usb_serial_jtag_ll_enable_bus_clock(true);
+        }
+        usb_serial_jtag_ll_phy_enable_pad(usj_pad_was_enabled_);
+        if (usj_clock_was_enabled_ && usj_intr_mask_ != 0) {
+            usb_serial_jtag_ll_ena_intr_mask(usj_intr_mask_);
+        }
+    }
+
+    void SetPwdnLocked(bool sleep) {
+        if (!pwdn_configured_) {
+            return;
+        }
+        gpio_set_level(kMosaicoCamPwdnPin, sleep ? 1 : 0);
+        if (power_down_ && !sleep) {
+            vTaskDelay(pdMS_TO_TICKS(25));
+        }
+        power_down_ = sleep;
+    }
+
+    static bool QuerySensorId(int fd, esp_cam_sensor_id_t* out_id) {
+        if (out_id == nullptr) {
+            return false;
+        }
+        struct v4l2_ext_control ctrl = {};
+        ctrl.id = ESP_CAM_SENSOR_IOC_G_CHIP_ID;
+        ctrl.size = sizeof(*out_id);
+        ctrl.p_u8 = reinterpret_cast<uint8_t*>(out_id);
+        struct v4l2_ext_controls ctrls = {};
+        ctrls.ctrl_class = V4L2_CTRL_CLASS_ESP_CAM_IOCTL;
+        ctrls.count = 1;
+        ctrls.controls = &ctrl;
+        return ioctl(fd, VIDIOC_G_EXT_CTRLS, &ctrls) == 0;
+    }
+
+    static bool SensorReadReg(int fd, uint16_t reg, uint8_t* out_val) {
+        esp_cam_sensor_reg_val_t rv = {};
+        rv.regaddr = reg;
+        struct v4l2_ext_control ctrl = {};
+        ctrl.id = ESP_CAM_SENSOR_IOC_G_REG;
+        ctrl.size = sizeof(rv);
+        ctrl.p_u8 = reinterpret_cast<uint8_t*>(&rv);
+        struct v4l2_ext_controls ctrls = {};
+        ctrls.ctrl_class = V4L2_CTRL_CLASS_ESP_CAM_IOCTL;
+        ctrls.count = 1;
+        ctrls.controls = &ctrl;
+        if (ioctl(fd, VIDIOC_G_EXT_CTRLS, &ctrls) != 0) {
+            return false;
+        }
+        *out_val = rv.value;
+        return true;
+    }
+
+    static bool SensorWriteReg(int fd, uint16_t reg, uint8_t val) {
+        esp_cam_sensor_reg_val_t rv = {};
+        rv.regaddr = reg;
+        rv.value = val;
+        struct v4l2_ext_control ctrl = {};
+        ctrl.id = ESP_CAM_SENSOR_IOC_S_REG;
+        ctrl.size = sizeof(rv);
+        ctrl.p_u8 = reinterpret_cast<uint8_t*>(&rv);
+        struct v4l2_ext_controls ctrls = {};
+        ctrls.ctrl_class = V4L2_CTRL_CLASS_ESP_CAM_IOCTL;
+        ctrls.count = 1;
+        ctrls.controls = &ctrl;
+        return ioctl(fd, VIDIOC_S_EXT_CTRLS, &ctrls) == 0;
+    }
+
+    void ApplySensorTuning(int fd) const {
+        if (sensor_pid_ == kOv3640Pid1 || sensor_pid_ == kOv3640Pid2) {
+            // Official Espressif ESP-Mosaico OV3640 advanced AWB calibration table.
+            struct RegPair {
+                uint16_t reg;
+                uint8_t val;
+            };
+            constexpr RegPair kOv3640Awb[] = {
+                {0x3317, 0x04}, {0x3316, 0xF8}, {0x3312, 0x26}, {0x3314, 0x42},
+                {0x3313, 0x2B}, {0x3315, 0x42}, {0x3310, 0xD0}, {0x3311, 0xBD},
+                {0x330C, 0x18}, {0x330D, 0x18}, {0x330E, 0x56}, {0x330F, 0x5C},
+                {0x330B, 0x1C}, {0x3306, 0x5C}, {0x3307, 0x11}, {0x3308, 0x25},
+            };
+            for (const auto& p : kOv3640Awb) {
+                SensorWriteReg(fd, p.reg, p.val);
+            }
+            uint8_t awb_ctrl = 0;
+            if (SensorReadReg(fd, 0x332B, &awb_ctrl)) {
+                SensorWriteReg(fd, 0x332B, static_cast<uint8_t>(awb_ctrl & ~0x08U));
+            }
+        } else if (sensor_pid_ == kSc101iotPid) {
+            // Official Espressif ESP-Mosaico SC101IOT DVP PCLK delay = 0 ns (reg 0x3640[1:0] = 0).
+            uint8_t pclk_reg = 0;
+            if (SensorReadReg(fd, 0x3640, &pclk_reg)) {
+                SensorWriteReg(fd, 0x3640, static_cast<uint8_t>(pclk_reg & ~0x03U));
+            }
+        }
+    }
+
+    mutable std::mutex mu_;
+    i2c_master_bus_handle_t subboard_i2c_ = nullptr;
+    ppa_client_handle_t ppa_client_ = nullptr;
+    bool present_ = false;
+    bool video_initialized_ = false;
+    bool pwdn_configured_ = false;
+    bool power_down_ = false;
+    bool usj_claimed_ = false;
+    bool usj_pad_was_enabled_ = false;
+    bool usj_clock_was_enabled_ = false;
+    uint32_t usj_intr_mask_ = 0;
+    uint16_t sensor_pid_ = 0;
+    uint32_t native_width_ = 0;
+    uint32_t native_height_ = 0;
+    std::string sensor_name_;
+#endif
+};
+
 class MosaicoBoard final : public Board {
 public:
     bool Init() override {
@@ -1141,6 +1877,8 @@ public:
 #endif
         touch_.Init();
         sensors_.Init();
+        // Modular left-slot camera is optional; failure degrades gracefully without blocking boot.
+        camera_.Init();
         return audio_.Init(16000, 16000);
     }
 
@@ -1148,7 +1886,7 @@ public:
     const char* ChipName() const override { return "esp32s31"; }
 
     std::vector<CapabilityDescriptor> Capabilities() const override {
-        return {
+        std::vector<CapabilityDescriptor> caps = {
             {"audio.output", "tool", "", {}},
             {"display.amoled", "tool", "", {"co5300", "480x480", "3d_avatar"}},
             {"sensor.imu_battery",
@@ -1157,11 +1895,15 @@ public:
              {"battery", "battery_voltage", "battery_current", "temperature", "imu", "accel_x",
               "accel_y", "accel_z", "gyro_x", "gyro_y", "gyro_z"}},
         };
+        if (camera_.IsPresent()) {
+            caps.push_back({"camera.capture", "tool", "http_post", {}});
+        }
+        return caps;
     }
 
     AudioCodecHal* Audio() override { return &audio_; }
     DisplayHal* Display() override { return &display_; }
-    CameraHal* Camera() override { return nullptr; }
+    CameraHal* Camera() override { return camera_.IsPresent() ? &camera_ : nullptr; }
     SensorHal* Sensors() override { return &sensors_; }
     GpioHal* Gpio() override { return &gpio_; }
     TouchHal* Touch() override { return &touch_; }
@@ -1191,6 +1933,7 @@ private:
 #endif
     MosaicoAudio audio_;
     MosaicoDisplay display_;
+    MosaicoCamera camera_;
     MosaicoSensors sensors_;
     MosaicoGpio gpio_;
     MosaicoTouch touch_;
